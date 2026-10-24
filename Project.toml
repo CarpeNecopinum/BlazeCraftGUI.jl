@@ -1,0 +1,20 @@
+name = "BlazecraftGUI"
+uuid = "e4a4d5f6-c8f5-4f22-a484-aeb6b4d2f5f6"
+version = "0.1.0"
+
+[deps]
+BlazeCraft = "b762ea48-c64f-410f-89e7-acff101548cf"
+Rocks = "4be72d32-6d9d-40bc-abe6-d593b8af2f05"
+SDL3 = "d6436c51-22c4-47c5-9af2-69281707dbc3"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[sources]
+BlazeCraft = {path = "../BlazeCraft.jl"}
+Rocks = {path = "../Rocks.jl"}
+SDL3 = {path = "../SDL3.jl"}
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
