@@ -1,4 +1,4 @@
-module BlazecraftGUI
+module BlazeCraftGUI
 
 import Rocks
 import Rocks: Enterprise as E

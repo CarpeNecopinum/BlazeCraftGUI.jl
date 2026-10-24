@@ -91,8 +91,8 @@ end
 
 Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm
 grid with thicker 100 mm majors, and the document's outlines, one stroke
-color per layer. `doc` is the list of `BlazecraftGUI.ArtObject`s; `camera`
-is the `BlazecraftGUI.Camera` for this frame.
+color per layer. `doc` is the list of `BlazeCraftGUI.ArtObject`s; `camera`
+is the `BlazeCraftGUI.Camera` for this frame.
 """
 function draw_workspace(ctx, camera, doc)
     _, _, cw, ch = ctx.rect

@@ -1,6 +1,6 @@
 using Test
-using BlazecraftGUI
-using BlazecraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
+using BlazeCraftGUI
+using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
                     layer_color, ArtObject
 using BlazeCraft.Shapes: PolyLine, Point
