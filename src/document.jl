@@ -124,6 +124,23 @@ function import_art(path::AbstractString)
 end
 
 """
+    rect_art(name, x0, y0, x1, y1, layer) -> ArtObject
+
+An axis-aligned closed rectangle from two opposite world corners (the
+rectangle tool's product). Corners are normalized, so a drag in any
+direction yields valid geometry; callers gate degenerate (near-zero area)
+drags before creating.
+"""
+function rect_art(name::AbstractString, x0::Float64, y0::Float64,
+                  x1::Float64, y1::Float64, layer::Int)
+    pl = PolyLine([Point(min(x0, x1), min(y0, y1)),
+                   Point(max(x0, x1), min(y0, y1)),
+                   Point(max(x0, x1), max(y0, y1)),
+                   Point(min(x0, x1), max(y0, y1))], true)
+    return ArtObject(String(name), [pl], layer)
+end
+
+"""
     translate(art, dx, dy) -> ArtObject
 
 Move an art object by `dx`/`dy` millimetres.

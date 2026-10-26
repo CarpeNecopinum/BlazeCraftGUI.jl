@@ -49,8 +49,7 @@ end
 # nothing selected it becomes the colour for newly created shapes.
 function LayerBar(; doc = Observable(ArtObject[]),
                   selection = Observable{Union{Nothing,Int}}(nothing),
-                  active_layer = Observable(0), fill = false)
-    doc_obs = @use doc
+                  active_layer = Observable(0), fill = false)    doc_obs = @use doc
     selection_obs = @use selection
     active_obs = @use active_layer
     t = E.theme()
@@ -83,6 +82,203 @@ function LayerBar(; doc = Observable(ArtObject[]),
 
     chips = Any[chip(l) for l in 0:(CUT_LAYERS + 1)]
     return E.StatusBar(grip = false, fill = fill, panels = chips)
+end
+
+# The Cuts/Layers panel: LightBurn's docked right window (analysis 03 §5).
+# One entry per layer that has geometry in the document; the abbreviated
+# settings block shows the mode and the speed/power pair. Double-clicking an
+# entry opens the process editor for that layer.
+function CutsLayersPanel(; doc = Observable(ArtObject[]),
+                         processes = Observable(Dict{Int,Process}()),
+                         editor_open = Observable(false),
+                         edit_layer = Observable(0),
+                         width = 240, fill = false)
+    doc_obs = @use doc
+    processes_obs = @use processes
+    editor_open_obs = @use editor_open
+    edit_layer_obs = @use edit_layer
+    t = E.theme()
+    small = t.metrics.font_size - 3
+    weaker = t.colors.disabled_text
+
+    header = @rock Box(
+        @rock E.Text("Cuts / Layers"; size = small, color = t.colors.text);
+        fill = true, background = t.colors.control, height = 22,
+        direction = :row, align = :center, padding = 6)
+    rows = Any[]
+    for l in document_layers(doc_obs[])
+        p = process_for(processes_obs[], l)
+        inner = @rock Row(
+            @rock Box(; width = 14, height = 14, radius = 3,
+                      background = layer_color(l),
+                      border_color = t.colors.border, border_width = 1),
+            @rock E.Text(layer_label(l); size = small, width = 30,
+                         color = t.colors.text),
+            @rock E.Text(mode_label(p.mode); color = weaker, size = small,
+                         width = 66),
+            @rock E.Text(quick_cuts(p); color = weaker, size = small, width = 74);
+            gap = 8, padding = 4, align = :center)
+        push!(rows, @rock Pressable(inner;
+                                    fill = true,
+                                    on_double_press = () -> begin
+                                        edit_layer_obs[] = l
+                                        editor_open_obs[] = true
+                                        nothing
+                                    end))
+    end
+    isempty(rows) && push!(rows, (@rock E.Text(
+        "no layers yet — import art";
+        color = t.colors.disabled_text, size = small)))
+    return @rock Box(header, rows...;
+                     direction = :column, gap = 0, width = width,
+                     height = "100%", fill = fill,
+                     background = t.colors.control,
+                     border_color = t.colors.border, border_width = 1)
+end
+
+# The left tool strip: LightBurn's creation toolbar (§5.9). For v1 two
+# tools: the mouse (select) tool and the rectangle tool. The strip is a
+# narrow column of icon buttons; the active tool shows a recessed
+# (item-hot) background until another tool is picked.
+function ToolsPanel(; tool = Observable(:mouse), width = 44, fill = false)
+    tool_obs = @use tool
+    t = E.theme()
+    function tool_button(icon_name, mode)
+        active = tool_obs[] === mode
+        @rock Pressable(
+            (@rock E.Icon(icon_name; size = 15, color = t.colors.text));
+            on_press = () -> (tool_obs[] = mode),
+            width = "100%", height = 36,
+            direction = :column, align = :center,
+            background = active ? t.gradients.item_hot : nothing,
+            hover_background = active ? t.gradients.item_hot :
+                                       t.gradients.button_hover,
+            pressed_background = t.gradients.item_hot,
+            border_color = active ? t.colors.hot_border : nothing,
+            border_width = active ? 1 : 0,
+            radius = t.metrics.control_radius)
+    end
+    return @rock Box(
+        (tool_button("select", :mouse)),
+        (tool_button("rectangle", :rect));
+        direction = :column, gap = 4, padding = 4, align = :start,
+        width = width, height = "100%", fill = fill,
+        background = t.colors.window,
+        border_color = t.colors.border, border_width = 1)
+end
+
+# The process editor: the Cut Settings Editor window for one layer
+# (analysis 03 §3/§4). Mounted as its own OS window like `MessageBox` — it
+# opens via the panel's double-click. The editor edits hook-state copies and
+# writes them back to the layer's stored process on OK; Cancel discards.
+function ProcessEditor(; open = Observable(false), layer = Observable(0),
+                       processes = Observable(Dict{Int,Process}()),
+                       width = 340)
+    open_obs = @use open
+    layer_obs = @use layer
+    processes_obs = @use processes
+    t = E.theme()
+    small = t.metrics.font_size - 3
+    open_obs[] || return nothing
+
+    # The edited copies live as hook state; a re-open syncs them back to the
+    # stored process (the effect owns nothing else, so mid-editing typing is
+    # safe — the fields don't write to `processes`).
+    mode = @use Observable(:line)
+    speed = @use Observable(6000.0)
+    max_power = @use Observable(20.0)
+    passes = @use Observable(1.0)
+    interval = @use Observable(0.100)
+    scan_angle = @use Observable(0.0)
+    kerf = @use Observable(0.0)
+    # §3 `Mode`: a dropdown over the three vector modes.
+    sel = @use Observable(1)
+    useEffect(() -> begin
+        base = process_for(processes_obs[], layer_obs[])
+        s = base.settings
+        mode[] = base.mode
+        sel[] = findfirst(==(base.mode), MODES)
+        speed[] = s.speed
+        max_power[] = s.max_power
+        passes[] = s.passes
+        interval[] = s.interval
+        scan_angle[] = s.scan_angle
+        kerf[] = s.kerf
+        nothing
+    end, (open_obs, layer_obs, processes_obs))
+
+    ok() = begin
+        processes_obs[] = with_process(processes_obs[], layer_obs[],
+            Process(mode = mode[],
+                    settings = CutSettings(speed = speed[],
+                                           max_power = max_power[],
+                                           passes = passes[],
+                                           interval = interval[],
+                                           scan_angle = scan_angle[],
+                                           kerf = kerf[])))
+        open_obs[] = false
+        return nothing
+    end
+    cancel() = (open_obs[] = false)
+
+    # §3 `Mode`: the dropdown drives `mode`, which drives the field slots.
+    mode_row = @rock Row(
+        (@rock Box(@rock E.Label("Mode"); width = 88, align = :center,
+                   direction = :row)),
+        (@rock E.ComboBox(
+            items = [mode_label(m) for m in MODES], selected = sel,
+            on_change = () -> mode[] = MODES[sel[]], width = 100));
+        gap = 4, align = :center)
+    # A labelled value row (same pattern as the position toolbar's spinners).
+    frow(label, obs, step) = @rock Row(
+        (@rock Box(@rock E.Label(label); width = 88, align = :center,
+                   direction = :row)),
+        (@rock E.Spinner(value = obs, step = step, width = 100));
+        padding = 3, gap = 4, align = :center)
+    # Only the mode-relevant parameters get slots (§3/§5.3: Speed/Power/
+    # Passes for every mode; Interval + Scan Angle for the scan modes; Kerf
+    # Offset for Line mode). Hidden slots render as a zero-height empty
+    # `Box` — a different kind than the `Row` — so the reconciler replaces
+    # the fiber instead of rebinding (statefully) a live row into it; see
+    # gotcha 31. Per-row padding (not column gap) keeps collapsed slots at
+    # zero size. Ternary arms stay parenthesized: a bare `@rock` next to a
+    # comma swallows the following list items (gotcha 34).
+    fhidden() = (@rock Box())
+    scans = mode[] == :fill || mode[] == :offset_fill
+    fields = (@rock Box(
+        frow("Speed", speed, 100.0),
+        frow("Power", max_power, 1.0),
+        frow("Passes", passes, 1.0),
+        (scans ? frow("Interval", interval, 0.050) : fhidden()),
+        (scans ? frow("Scan angle", scan_angle, 1.0) : fhidden()),
+        (scans ? fhidden() : frow("Kerf", kerf, 0.010));
+        direction = :column, align = :start))
+    footer = @rock Box(
+        Mechanics.Button(; label = "OK", on_press = ok, width = 70,
+                         height = t.metrics.button_height, size = small,
+                         font = t.font, bevel = :raised, border_width = 1,
+                         border_color = t.colors.border),
+        Mechanics.Button(; label = "Cancel", on_press = cancel, width = 70,
+                         height = t.metrics.button_height, size = small,
+                         font = t.font, bevel = :raised, border_width = 1,
+                         border_color = t.colors.border);
+        direction = :row, gap = 8, align = :center, justify = :end,
+        padding = 10)
+    body = @rock Box(
+        mode_row, fields, footer;
+        direction = :column, gap = 10, padding = 14, align = :start,
+        background = t.colors.control, fill = true)
+    return Rocks.Element(
+        Rocks.Window,
+        Dict{Symbol,Any}(:title => "Process — layer " *
+                                    layer_label(layer_obs[]),
+                         :width => width, :fit_content => true,
+                         :background => t.colors.control,
+                         :padding => 1, :direction => :column,
+                         :position => :cascade, :resizable => false,
+                         :on_close => cancel),
+        Any[body],
+    )
 end
 
 # The Position toolbar: LightBurn's Numeric Edits toolbar (analysis 02 §3.6).
@@ -236,7 +432,8 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
 end
 
 function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing,
-             active_layer = nothing)
+             active_layer = nothing, processes = nothing,
+             editor_open = nothing, edit_layer = nothing, tool = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
@@ -254,6 +451,20 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     # has no creation tools yet — the state and the bar highlight exist now.
     active_internal = @use Observable(0)
     active_layer = active_layer === nothing ? active_internal : active_layer
+    # The per-layer processes (analysis 03) and the editor's open state.
+    processes_internal = @use Observable(Dict{Int,Process}())
+    processes = processes === nothing ? processes_internal : processes
+    editor_open_internal = @use Observable(false)
+    edit_layer_internal = @use Observable(0)
+    editor_open = editor_open === nothing ? editor_open_internal : editor_open
+    edit_layer = edit_layer === nothing ? edit_layer_internal : edit_layer
+    # The active tool (:mouse select / :rect rectangle), shared between the
+    # tool strip and the workspace; injectable for tests.
+    tool_internal = @use Observable(:mouse)
+    tool = tool === nothing ? tool_internal : tool
+    # The workspace/panel split: LightBurn's right dock starts out ~80% of
+    # the window; the handle is draggable.
+    split_ratio = @use Observable(0.78)
     pending_open = @use Observable{Union{Nothing,FileDialogResult}}(nothing)
     error_open = @use Observable(false)
     last_error = @use Observable("")
@@ -306,8 +517,25 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                                      active_layer = active_layer);
                             gap = 6, align = :center)),
         children = Any[
-            (@rock Workspace(doc = doc, selection = selection;
-                flex = 1, fill = true, height = "100%")),
+            (@rock Row(
+                (@rock ToolsPanel(tool = tool; fill = true)),
+                (@rock Split(
+                    (@rock Box(
+                        (@rock Workspace(doc = doc, selection = selection,
+                                         processes = processes, tool = tool,
+                                         active_layer = active_layer;
+                                         fill = true, height = "100%"));
+                        fill = true)),
+                    (@rock Box(
+                        (@rock CutsLayersPanel(doc = doc, processes = processes,
+                                               editor_open = editor_open,
+                                               edit_layer = edit_layer, fill = true));
+                        padding = 8, fill = true));
+                    direction = :horizontal, ratio = split_ratio,
+                    flex = 1, fill = true));
+                gap = 2, fill = true, height = "100%")),
+            (@rock ProcessEditor(open = editor_open, layer = edit_layer,
+                                 processes = processes)),
             (@rock E.MessageBox(open = error_open, title = "Import failed",
                                 message = last_error[], icon = :warning)),
         ])

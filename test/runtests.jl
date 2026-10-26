@@ -203,6 +203,47 @@ end
     end
 end
 
+@testset "even-odd fill (fills.jl)" begin
+    sqring(a, b, c, d) = [(a, b), (c, b), (c, d), (a, d)]
+    rows = 0:49
+
+    # A single square: one run spanning it inside, nothing outside.
+    runs = even_odd_runs([sqring(10.0, 10.0, 40.0, 40.0)], rows)
+    @test length(runs) == length(rows)
+    @test isempty(runs[1])                      # scan centre y = 0.5
+    @test isempty(runs[50])                     # scan centre y = 49.5
+    inner = runs[31]                            # scan centre y = 30.5
+    @test length(inner) == 1
+    @test inner[1][1] ≈ 10.0 && inner[1][2] ≈ 40.0
+
+    # Two overlapping squares: the shared area erases (§3 same-layer
+    # semantics) — the overlap split reads as two disjoint runs.
+    runs = even_odd_runs([sqring(10.0, 10.0, 40.0, 40.0),
+                          sqring(25.0, 10.0, 55.0, 40.0)], rows)
+    mid = runs[31]
+    @test length(mid) == 2
+    @test mid[1][1] ≈ 10.0 && mid[1][2] ≈ 25.0
+    @test mid[2][1] ≈ 40.0 && mid[2][2] ≈ 55.0
+
+    # A hole: nested rings — the interior of the inner one stays empty.
+    ringrows = 0:99
+    runs = even_odd_runs([sqring(0.0, 0.0, 100.0, 100.0),
+                          sqring(40.0, 30.0, 60.0, 70.0)], ringrows)
+    center = runs[41]                           # scan centre y = 40.5
+    @test length(center) == 2                   # crossed the hole, not through
+    # A row below the hole is one solid run again.
+    @test runs[21][1][1] ≈ 0.0 && runs[21][1][2] ≈ 100.0
+
+    # Painting: the runs mark exactly the even-odd interior pixels.
+    pixels = zeros(UInt32, 110 * 100)
+    paint_even_odd!(pixels, runs, 110; rows = ringrows, color = (1.0, 0.0, 0.0))
+    red = (UInt32(255) << 24) | UInt32(255) << 16
+    @test pixels[40 * 110 + 12] == red          # x=11: inside the outer ring
+    @test pixels[40 * 110 + 51] == 0x00000000   # x=50: inside the hole
+    @test pixels[40 * 110 + 106] == 0x00000000  # x=105: right of the ring
+    @test pixels[40 * 110 + 71] == red          # x=70: right of the hole
+end
+
 using Rocks: Observable
 
 @testset "position toolbar" begin
@@ -332,5 +373,276 @@ end
             Rocks.unmount!(tree)
             Rocks.shutdown_backend()
         end
+    end
+end
+
+@testset "cut processes" begin
+    pl = PolyLine([Point(0.0, 0.0), Point(40.0, 0.0), Point(40.0, 20.0),
+                   Point(0.0, 20.0)], true)
+
+    @testset "process model" begin
+        # The three vector modes; Image mode has no use in a vector-only v1.
+        @test MODES == (:line, :fill, :offset_fill)
+        @test mode_label(:line) == "Line"
+        @test mode_label(:fill) == "Fill"
+        @test mode_label(:offset_fill) == "Offset Fill"
+        # Universal defaults (§3): 6000 mm/min, 20% power, a single pass.
+        p = Process()
+        @test p.mode == :line
+        s = p.settings
+        @test s.speed == 6000.0 && s.max_power == 20.0
+        @test s.passes == 1.0 && s.interval == 0.1
+        @test s.scan_angle == 0.0 && s.kerf == 0.0
+        # Abbreviated Cuts/Layers readout: whole numbers, `%` on the power.
+        @test quick_cuts(p) == "6000 / 20%"
+        p2 = Process(mode = :fill,
+                     settings = CutSettings(speed = 3000.0, max_power = 40.0))
+        @test quick_cuts(p2) == "3000 / 40%"
+    end
+
+    @testset "document_layers" begin
+        arts = [ArtObject("a", [pl], 0), ArtObject("b", [pl], 3),
+                ArtObject("c", [pl], 0)]
+        # Every layer with at least one object, sorted, duplicates collapsed.
+        @test document_layers(arts) == [0, 3]
+        # Tool layers have no cut parameters and never get an entry.
+        @test document_layers([ArtObject("t", [pl], 30)]) == Int[]
+        @test document_layers(ArtObject[]) == Int[]
+    end
+
+    @testset "process_for / with_process" begin
+        procs = Dict{Int,Process}()
+        # A layer with no stored process runs its mode's default.
+        @test process_for(procs, 2).mode == :line
+        # Storing is immutable-style: the source dict is untouched.
+        stored = with_process(procs, 2, Process(mode = :fill))
+        @test process_for(stored, 2).mode == :fill
+        @test process_for(stored, 3).mode == :line
+        @test haskey(stored, 2)
+        @test procs == Dict{Int,Process}()
+    end
+
+    @testset "cuts panel" begin
+        doc = Observable([ArtObject("a", [pl], 0), ArtObject("b", [pl], 2)])
+        processes = Observable(Dict{Int,Process}())
+        editor_open = Observable(false)
+        edit_layer = Observable(0)
+        bar = () -> (Rocks.@rock CutsLayersPanel(
+            doc = doc, processes = processes,
+            editor_open = editor_open, edit_layer = edit_layer))
+        Rocks.RUNNING[] = true
+        Rocks.DIRTY[] = true
+        Rocks.init_backend()
+        tree = Rocks.create_root(bar, (;))
+        Rocks.perform_render!(tree)
+        Rocks.run_effects!()
+        Rocks.flush_dirty!()
+        try
+            pressables = Rocks.Fiber[]
+            collect_press(f) = begin
+                f.kind === Rocks.Pressable && push!(pressables, f)
+                foreach(collect_press, f.children)
+            end
+            collect_press(tree)
+            # One row per layer with geometry.
+            @test length(pressables) == 2
+            # Rows all carry the double-press opener.
+            @test all(p -> haskey(p.props, :on_double_press), pressables)
+            # Double-clicking an entry opens the editor for that layer.
+            pressables[2].props[:on_double_press]()
+            @test edit_layer[] == 2
+            @test editor_open[] == true
+        finally
+            Rocks.RUNNING[] = false
+            Rocks.unmount!(tree)
+            Rocks.shutdown_backend()
+        end
+    end
+
+    @testset "process editor" begin
+        processes = Observable(Dict{Int,Process}())
+        open = Observable(true)
+        layer = Observable(1)
+        ed = () -> (Rocks.@rock ProcessEditor(open = open, layer = layer,
+                                              processes = processes))
+        Rocks.RUNNING[] = true
+        Rocks.DIRTY[] = true
+        Rocks.init_backend()
+        tree = Rocks.create_root(ed, (;))
+        Rocks.perform_render!(tree)
+        Rocks.run_effects!()
+        Rocks.flush_dirty!()
+        # A mechanics Button is a pressable whose label is a child `Text`
+        # carrying the name as its rendered string (the fiber's child holds
+        # the label value).
+        function find_button(f, name)
+            f.kind === Rocks.Text &&
+                any(==(name), string.(get(f.props, :children, ()))) &&
+                return f.parent
+            for c in f.children
+                hit = find_button(c, name)
+                hit === nothing || return hit
+            end
+            return nothing
+        end
+        try
+            # A closed editor renders nothing and mints no window.
+            open[] = false
+            Rocks.flush_dirty!()
+            closed = Rocks.collect_windows!(Rocks.Fiber[], tree)
+            @test isempty(closed)
+            open[] = true
+            Rocks.flush_dirty!()
+
+            ok = find_button(tree, "OK")
+            cancel = find_button(tree, "Cancel")
+            @test ok !== nothing && cancel !== nothing
+            # OK writes the layer's process (mode from effect sync: `line`,
+            # the defaults).
+            ok.props[:on_press]()
+            @test open[] == false
+            @test haskey(processes[], 1)
+            @test processes[][1].mode == :line
+            @test processes[][1].settings.speed == 6000.0
+            # Cancel never writes.
+            processes2 = Observable(Dict{Int,Process}())
+            open2 = Observable(true)
+            layer2 = Observable(1)
+            tree2 = Rocks.create_root(() -> (Rocks.@rock ProcessEditor(
+                open = open2, layer = layer2, processes = processes2)), (;))
+            Rocks.perform_render!(tree2)
+            Rocks.run_effects!()
+            Rocks.flush_dirty!()
+            cancel2 = find_button(tree2, "Cancel")
+            cancel2.props[:on_press]()
+            @test open2[] == false
+            @test processes2[] == Dict{Int,Process}()
+            Rocks.unmount!(tree2)
+
+            # Only the mode-relevant parameters get slots: a Fill process
+            # shows Interval/Scan angle and no Kerf; a Line process the
+            # reverse.
+            labels(f, acc = String[]) = begin
+                f.kind === Rocks.Text &&
+                    append!(acc, string.(get(f.props, :children, ())))
+                foreach(c -> labels(c, acc), f.children)
+                acc
+            end
+            for (mode, want, absent) in
+                ((:fill, ["Interval", "Scan angle"], ["Kerf"]),
+                 (:line, ["Kerf"], ["Interval", "Scan angle"]))
+                procs3 = Observable(Dict{Int,Process}(1 => Process(mode = mode)))
+                open3 = Observable(true)
+                tree3 = Rocks.create_root(() -> (Rocks.@rock ProcessEditor(
+                    open = open3, layer = Observable(1),
+                    processes = procs3)), (;))
+                Rocks.perform_render!(tree3)
+                Rocks.run_effects!()
+                Rocks.flush_dirty!()
+                names = labels(tree3)
+                @test all(w -> w in names, want)
+                @test all(a -> a ∉ names, absent)
+                Rocks.unmount!(tree3)
+            end
+        finally
+            Rocks.RUNNING[] = false
+            Rocks.unmount!(tree)
+            Rocks.shutdown_backend()
+        end
+    end
+end
+
+@testset "rectangle tool and editor click-through" begin
+    # The full user path through the real event pipeline (Rocks src/driver.jl):
+    # pick the rectangle tool, drag a rectangle on the workspace, then
+    # double-press the process row that appears. The editor opens as its own
+    # window and the main window's layout stays intact — a mounted window
+    # must not join the flow (it used to squish the workspace).
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable{Union{Nothing,Int}}(nothing)
+    processes = Observable(Dict{Int,Process}())
+    tool = Observable(:mouse)
+    active_layer = Observable(0)
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              processes = processes, tool = tool,
+                              active_layer = active_layer)) do root
+        windows = Rocks.sync_windows!(root)
+        @test length(windows) == 1
+        main = windows[1]
+        Rocks.draw_window!(main)             # the first draw applies the view fit
+
+        # 1. Pick the rectangle tool: the strip button with the ▭ glyph.
+        rect_btn = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Pressable &&
+                Rocks.find_by_label(f, "▭") !== nothing
+        end
+        @test rect_btn !== nothing
+        Rocks.click!(rect_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :rect
+
+        # 2. Drag a rectangle: press at world (100, 100), drag to (200, 160).
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        @test canvas !== nothing
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        pt(p) = begin
+            s = apply(matrix(cam), p)
+            (round(Int, canvas.rect[1] + s[1]),
+             round(Int, canvas.rect[2] + s[2]))
+        end
+        a, b = pt(SVector(100.0, 100.0)), pt(SVector(200.0, 160.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, a...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_MOTION, b...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 1
+        @test doc[][1].name == "rectangle"
+        @test doc[][1].layer == 0
+        @test selection[] == 1
+        # The created rectangle spans the dragged corners (world mm, y-up);
+        # the drag lands on pixel centres, so allow the rounding slack.
+        bounds = document_bounds(doc[])
+        @test isapprox(bounds[1][1], 100.0; atol = 0.5)
+        @test isapprox(bounds[1][2], 100.0; atol = 0.5)
+        @test isapprox(bounds[2][1], 200.0; atol = 0.5)
+        @test isapprox(bounds[2][2], 160.0; atol = 0.5)
+
+        # 3. The process row shows up on layer 00; double-pressing it opens
+        # the editor as its own window. The doc change re-laid-out the
+        # panel — sync first, or the fresh row has no placed rect and the
+        # click would land at the window origin (the menu bar).
+        split = Rocks.find_kind(main, Rocks.Split)
+        @test split !== nothing
+        split_h = split.rect[4]
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing,
+                                 windows)]
+        row = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Pressable &&
+                Rocks.find_by_label(f, "00") !== nothing
+        end
+        @test row !== nothing
+        @test row.rect[3] > 0 && row.rect[4] > 0
+        Rocks.click!(row; clicks = 2)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        windows = Rocks.sync_windows!(root)
+        @test length(windows) == 2           # the editor is its own window
+        main = windows[findfirst(w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing,
+                                 windows)]
+        editor = windows[findfirst(w -> Rocks.find_kind(w, Rocks.Canvas) === nothing,
+                                   windows)]
+        @test Bool(get(editor.props, :fit_content, false))
+        # The workspace split is exactly as tall as before (no squish).
+        @test Rocks.find_kind(main, Rocks.Split).rect[4] == split_h
     end
 end

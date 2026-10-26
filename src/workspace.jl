@@ -227,6 +227,73 @@ function draw_handle(ctx, x, y; fill = (1.0, 1.0, 1.0), border = (0.1, 0.1, 0.1)
     return nothing
 end
 
+# One cached layer fill: the software texture and the key it was painted for.
+mutable struct LayerFillTexture
+    tex::Any                    # SDL3.Texture
+    key::Tuple
+    w::Int
+    h::Int
+end
+
+"""
+    draw_layer_fills!(ctx, m, doc, processes, fill_caches)
+
+Paint the region fills of all scan-mode (`fill`/`offset_fill`) layers, each
+as one even-odd texture of the canvas size, blitted before the strokes.
+
+The scan covers **all closed geometry of a layer in one pass** so the
+even-odd rule sees the whole set: overlapping same-layer shapes erase each
+other and interior holes appear (§3 Fill-mode semantics). Per-layer document
+identity (object ids of the paths on the layer) and the camera are part of
+the texture's cache key, so a document edit or a view change re-scans only
+the affected layers — a still camera with animated selection dashes reuses
+the cached texture.
+"""
+function draw_layer_fills!(ctx, m, doc, processes, fill_caches)
+    w, h = round(Int, ctx.rect[3]), round(Int, ctx.rect[4])
+    (w > 0 && h > 0) || return nothing
+    # Group the closed rings of each layer, camera-transformed to canvas
+    # coordinates, together with the layer's process mode and identity.
+    rings = Dict{Int,Vector{Vector{Tuple{Float64,Float64}}}}()
+    layer_ids = Dict{Int,Vector{UInt}}()
+    layer_mode = Dict{Int,Symbol}()
+    for obj in doc
+        pmode = process_for(processes, obj.layer).mode
+        (pmode == :fill || pmode == :offset_fill) || continue
+        rs = get!(rings, obj.layer, Vector{Vector{Tuple{Float64,Float64}}}())
+        ids = get!(layer_ids, obj.layer, UInt[])
+        layer_mode[obj.layer] = pmode
+        for pl in obj.paths
+            pl.closed || continue              # fill mode: closed shapes only
+            length(pl.points) < 3 && continue
+            push!(rs, [Tuple(apply(m, p)) for p in pl.points])
+            push!(ids, objectid(pl))
+        end
+    end
+    for layer in sort!(collect(keys(rings)))
+        key = (layer_mode[layer], w, h,
+               Tuple(round.(vec(Matrix(m)), digits = 9)), layer_ids[layer])
+        lf = get(fill_caches, layer, nothing)
+        if !(lf isa LayerFillTexture) || lf.key != key
+            lf === nothing || !(lf isa LayerFillTexture) || lf.w == w &&
+                lf.h == h || (SDL3.DestroyTexture(lf.tex); nothing)
+            tex = lf isa LayerFillTexture && lf.w == w && lf.h == h ? lf.tex :
+                  SDL3.CreateTexture(ctx.renderer, SDL3.SDL_PIXELFORMAT_ARGB8888,
+                                     SDL3.SDL_TEXTUREACCESS_STREAMING, w, h)
+            pixels = zeros(UInt32, w * h)
+            runs = even_odd_runs(rings[layer], 0:(h - 1))
+            paint_even_odd!(pixels, runs, w; rows = 0:(h - 1),
+                            color = layer_color(layer))
+            SDL3.UpdateTexture(tex, nothing, reinterpret(UInt8, pixels),
+                               Int32(4w))
+            lf = LayerFillTexture(tex, key, w, h)
+            fill_caches[layer] = lf
+        end
+        ctx.texture(lf.tex, 0.0, 0.0; w = float(w), h = float(h))
+    end
+    return nothing
+end
+
 """
     draw_workspace(ctx, camera, doc, selection, dash_phase)
 
@@ -234,8 +301,23 @@ Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm grid
 with thicker 100 mm majors, the document's outlines (one stroke color per
 layer) — and, when a shape is selected, its marching-dash outline, a dashed
 bounding box and the transform handles.
+
+`processes` carries the per-layer process assignment: layers whose mode is
+`fill` or `offset_fill` render their closed geometry as an **even-odd**
+region fill (§3 Fill mode semantics — same-layer overlaps erase) beneath the
+strokes. The fills are painted into per-layer software textures cached in
+`fill_cache` (a plain `Dict`; provided by the Workspace as hook state), so
+the redraw-per-dash-frame of the marching selection never re-scans an
+unchanged fill.
+
+`preview` = `((x0, y0), (x1, y1))` (world millimetres), the rectangle
+tool's in-progress drag, drawn dashed in `preview_color` above the document.
 """
-function draw_workspace(ctx, camera, doc, selection, dash_phase)
+function draw_workspace(ctx, camera, doc, selection, dash_phase;
+                        processes = Dict{Int,Process}(),
+                        fill_cache = Dict{Int,Any}(),
+                        preview = nothing,
+                        preview_color = (0.1, 0.1, 0.1))
     _, _, cw, ch = ctx.rect
     m = matrix(camera)
     ctx.clear((0.86, 0.87, 0.89))          # tone outside the work area
@@ -259,6 +341,10 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase)
         draw_segment(ctx, m, segment; color = (0.55, 0.60, 0.65), width = 1.0)
     end
 
+    # Scan-mode layers paint their region fill first: the strokes still read
+    # on top, and same-layer overlaps erase through the even-odd rule.
+    draw_layer_fills!(ctx, m, doc, processes, fill_cache)
+
     for (idx, obj) in enumerate(doc)
         selected = selection !== nothing && idx == selection
         for (path_index, pl) in enumerate(obj.paths)
@@ -277,6 +363,18 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase)
                              closed = pl.closed)
             end
         end
+    end
+
+    # The rectangle tool's in-progress drag: a dashed preview above the
+    # document, in the active layer's colour.
+    if preview !== nothing
+        ((sx, sy), (ex, ey)) = preview
+        a = apply(m, SVector(sx, sy))
+        b = apply(m, SVector(ex, ey))
+        draw_dashed_polyline(ctx, [(a[1], a[2]), (b[1], a[2]),
+                                   (b[1], b[2]), (a[1], b[2])];
+                             color = preview_color, width = 1.5,
+                             dash = 5.0, gap = 3.0, closed = true)
     end
 
     # The selection decoration: dashed bounding box, transform handles.
@@ -347,9 +445,19 @@ the client area, because the scroll content never gives `flex` extra space
 to grow into.
 """
 function Workspace(; doc = Observable(ArtObject[]),
-                   selection = Observable{Union{Nothing,Int}}(nothing), props...)
+                   selection = Observable{Union{Nothing,Int}}(nothing),
+                   processes = Observable(Dict{Int,Process}()),
+                   tool = Observable(:mouse),
+                   active_layer = Observable(0), props...)
     doc_obs = @use doc
     selection_obs = @use selection
+    processes_obs = @use processes
+    tool_obs = @use tool
+    active_obs = @use active_layer
+
+    # Per-layer fill textures (fills.jl): canvas-local software textures,
+    # recreated when their layer's geometry, mode or the camera changes.
+    fill_caches = @use Ref(Dict{Int,Any}())
 
     # View state: the camera, as hook state, so it survives the per-frame
     # body re-runs. Writes trigger a (draw-marked) re-render.
@@ -358,18 +466,31 @@ function Workspace(; doc = Observable(ArtObject[]),
     # Silent hook state (stable across re-renders, no re-render on write).
     fit_pending = @use Ref(true)
     fit_count = @use Ref(-1)
-    # The active drag: the mode (:translate/:scale_N/:rotate_N), the dragged
-    # shape's original geometry, its original world bbox and the start point.
+    # Suppressor for the count-refit below: a created rectangle changes the
+    # object count (like an import does) but must not refit the view.
+    no_refit = @use Ref(false)
+    # The active drag: the mode (:translate/:scale_N/:rotate_N/:rect), the
+    # dragged shape's original geometry, its original world bbox and the
+    # start point.
     drag_mode = @use Ref(:none)
     drag_art = @use Ref{Any}(nothing)
     drag_bbox = @use Ref{Any}(nothing)
     drag_start = @use Ref((0.0, 0.0))
+    # Rectangle tool: the world-space corner dragged so far, re-rendered as
+    # an observable (the preview must draw on every motion event). The drag
+    # start lives in `drag_start`.
+    rect_drag = @use Observable{Union{Nothing,Tuple{Float64,Float64}}}(nothing)
 
     # Refit when a new import changes the object count (an edit keeps the
-    # count, so moving/scaling a shape never refits the view).
+    # count, so moving/scaling a shape never refits the view). A created
+    # rectangle also changes the count — the `no_refit` suppressor set by
+    # the tool's commit path keeps the view still.
     useEffect(() -> begin
         count = length(doc_obs[])
-        if count != fit_count[]
+        if no_refit[]
+            fit_count[] = count
+            no_refit[] = false
+        elseif count != fit_count[]
             fit_count[] = count
             fit_pending[] = true
         end
@@ -404,12 +525,25 @@ function Workspace(; doc = Observable(ArtObject[]),
                     fit_pending[] = false
                 end
                 draw_workspace(ctx, camera, doc_obs[], selection_obs[],
-                               mod(time() * 20.0, 10.0))
+                               mod(time() * 20.0, 10.0);
+                               processes = processes_obs[],
+                               fill_cache = fill_caches[],
+                               preview = rect_drag[] === nothing ? nothing :
+                                         (drag_start[], rect_drag[]),
+                               preview_color = layer_color(active_obs[]))
             end,
             # The bed tone distinguishes the canvas from the desktop gray
             # that Tools panels use in Rocks' Enterprise theme.
             background = (0.86, 0.87, 0.89), fill = true);
         on_down = (x, y, _) -> begin
+            # Rectangle tool: start a creation drag; no selection changes.
+            if tool_obs[] === :rect
+                w = inv(matrix(view[])) * SVector(x, y, 1.0)
+                drag_mode[] = :rect
+                drag_start[] = (w[1], w[2])
+                rect_drag[] = (w[1], w[2])
+                return nothing
+            end
             sel = selection_obs[]
             # 1. Transform handles of the current selection.
             if sel !== nothing
@@ -437,6 +571,13 @@ function Workspace(; doc = Observable(ArtObject[]),
         on_move = (x, y) -> begin
             mode = drag_mode[]
             mode == :none && return nothing
+            if mode == :rect
+                # The preview updates the observable → a re-render (and a
+                # redraw) on every motion event.
+                w = inv(matrix(view[])) * SVector(x, y, 1.0)
+                rect_drag[] = (w[1], w[2])
+                return nothing
+            end
             sel = selection_obs[]
             sel === nothing && return nothing
             inv_m = inv(matrix(view[]))
@@ -480,6 +621,21 @@ function Workspace(; doc = Observable(ArtObject[]),
             return nothing
         end,
         on_up = (_, _, _) -> begin
+            # Rectangle tool: commit the drag as a new rectangle on the
+            # active layer and select it (creation tools stay active, the
+            # mouse tool is switched back with its toolbar button).
+            if drag_mode[] == :rect
+                (sx, sy) = drag_start[]
+                (ex, ey) = rect_drag[] !== nothing ? rect_drag[] : (sx, sy)
+                if abs(ex - sx) > 0.5 && abs(ey - sy) > 0.5    # ≥ 0.5 mm × 0.5 mm
+                    no_refit[] = true
+                    doc_obs[] = vcat(doc_obs[], [rect_art(
+                        "rectangle", Float64(sx), Float64(sy),
+                        Float64(ex), Float64(ey), active_obs[])])
+                    selection_obs[] = length(doc_obs[])
+                end
+                rect_drag[] = nothing
+            end
             drag_mode[] = :none
             drag_art[] = nothing
             return nothing
@@ -489,6 +645,7 @@ function Workspace(; doc = Observable(ArtObject[]),
         # Inside a Form's scroll column `flex` has no height to grow into:
         # the caller passes `fill = true, height = "100%"` via `props` for
         # the full client area. The open grab hand hovers here, the closed
-        # hand shows while pressed.
-        cursor = :grab)
+        # hand shows while pressed — a crosshair while a creation tool is
+        # active.
+        cursor = tool_obs[] === :rect ? :crosshair : :grab)
 end

@@ -954,3 +954,146 @@ highlighted chip border). The App glues `Row(DocStatus, Box(flex=1), LayerBar)` 
     the testset's helper closures resolve to; imports belong at the top of `test/runtests.jl`.
 28. **List comp sizes**: `panels = Any[chips..., extra]` vs `vcat` — prefer plain vectors; wrong ranges show
     up as quietly-missing panels (T2), not errors.
+
+### 8.11 Cuts/Layers panel round (2026-10-26)
+
+**Process model** (`src/cuts.jl`): `MODES = (:line, :fill, :offset_fill)` with `mode_label`; `CutSettings`
+(Base.@kwdef: speed 6000 mm/min, max_power 20%, min_power 0, passes 1.0, interval 0.1, scan_angle 0°,
+kerf 0 — the §3 universal defaults); `Process(mode, settings)`; `quick_cuts(p)` renders the §5.2
+`Spd/Pwr` readout (`"6000 / 20%"`, whole numbers); `document_layers(arts)` = sorted unique non-tool
+layers with ≥1 object (§5.1 — every such layer gets a panel entry); `process_for(procs, layer)` falls
+back to the default for not-yet-stored layers; `with_process` is the immutable-style store.
+
+**CutsLayersPanel** (`src/app.jl`): a docked right column in a **`Split`** (`ratio` hook starts at 0.78)
+— the panes wrap each side in a `Box(fill = true)`; the panel side adds `padding = 8`. One `Pressable` row
+per document layer (chip, `layer_label`, `mode_label`, `quick_cuts`), empty state text when no geometry.
+Rows carry `on_double_press` opening the editor.
+
+**ProcessEditor** (`src/app.jl`): mounts as its **own OS window** via
+`Rocks.Element(Rocks.Window, Dict{Symbol,Any}(...), Any[body])` — the MessageBox pattern (position
+`= :cascade`, `on_close` = cancel; closed = return `nothing`, no window). Editing is on hook-state
+copies (`mode`, `speed`, `max_power`, `passes`, `interval`, `scan_angle`, `kerf`); a `useEffect` on
+`(open, layer, processes)` syncs copies from the stored process; **OK** writes back via `with_process`,
+**Cancel** just closes (copies die with the render). **Mode is an `E.ComboBox`** (items = mode labels,
+1-based `selected` observable; `on_change` maps the index to `mode`); only mode-relevant parameters get
+field slots (Speed/Power/Passes always; +Interval/Scan angle for the scan modes; Kerf for Line mode),
+with hidden slots as zero-height `Box` placeholders — see gotcha 31.
+
+**Rocks: `on_double_press`** (`src/events.jl`): SDL counts consecutive clicks (`mouse_button_event.clicks`);
+button-up with `clicks >= 2` routes to `on_double_press` instead of the `on_press`/`on_click` pair, only when
+the handler is present (zero impact on existing UIs). Test helper `push_mouse!` grew a `clicks` kwarg.
+
+**New gotchas (verified empirically)**:
+
+29. **Component fibers stack output like a gap-less column — they don't stretch unless told** — the App
+    placed `CutsLayersPanel` next to the Workspace with `height = "100%"` alone; the panel stayed at content
+    height (66px) because the child *component* fiber of the Row is not stretched (the Row stretches only
+    children that carry `fill = true` themselves). Fix: pass `fill = true` to the component, whose top
+    `Box` forwards it (the same pattern the Workspace's wrapper Box uses). Diagnosed with the headless
+    geometry probe (`measure!/place!` then walk `f.rect` + `props`).
+30. **`Text` defaults to white** — `text_props` falls back to `(1,1,1)`; on the light theme headline texts
+    ("Cuts / Layers", "Layer 01") were near-invisible until `color = t.colors.text` was passed explicitly.
+    `E.Label` wraps Text with the right default; raw `E.Text`/bare `Text` must always get `color`.
+31. **Never let a child list's *length* depend on interaction state without a kind change** — the editor
+    first showed only mode-relevant fields (Interval/Scan angle for fill modes, Kerf for Line). Switching
+    mode grew/shrank the row list; the reconciler matches children **positionally**, so row 4 ("Interval")
+    kept the old "Kerf" spinner fiber's displayed text while its props were swapped (Interval showed 0.0
+    with the observable at 0.1). Safe pattern: keep a fixed slot count and render hidden slots as a
+    **zero-height empty `Box`** — a *different kind* than the `Row` — so the reconciler replaces the fiber
+    (fresh component state) instead of rebinding a live one. The mode dropdown now drives such slots; the
+    window height follows the visible rows (superseded by the `fit_content` windows below).
+32. **`Split` needs `fill = true` to span the Form's scroll column and an explicit `ratio` observable** —
+    without `fill` it measured its 400×300 default (right pane clipped at x=400); without `ratio` the
+    seeded default gave a cramped left pane. Panes fill their sides exactly; wrap each side in a plain
+    `Box(fill = true)` (+ `padding` for the docked panel) and give the side components `fill = true` so
+    their own internals stretch.
+33. **Mechanics buttons in tests**: find a `Mechanics.Button` by its label — the pressable fiber's label is
+    a child fiber with `kind === Rocks.Text` and the string inside `fiber.props[:children]` (mounted text
+    fibers carry empty `children`; the values live in props).
+34. **A bare `@rock` next to a comma swallows the rest of the arg list** — `scan ? row : @rock Box(),
+    next_child, …` made the `Box` end up with 4 children instead of 6: the space-spliced macro call
+    parsed the following arguments as its own. Parenthesize every ternary arm (and prefer a tiny
+    `fhidden()` helper over a shared element).
+
+**Rocks: `fit_content` windows** (`src/backend.jl`, `src/layout.jl`): a window created with
+`fit_content = true` measures its own child fibers (`fit_window_size`: Σ main-axis sizes + gaps +
+2×padding, cross = max + 2×padding) instead of reading `width`/`height` props; explicit `width`/`height`
+props act as **per-axis overrides**. Every layout pass re-checks the natural size (the `measure!` window
+branch) and resizes the OS window via `SetWindowSize` when it drifted — so a mode switch in the editor
+that adds/removes a field row grows/shrinks the window automatically. Verified: the editor renders
+340×261 in Fill mode (Interval + Scan angle rows) and 340×232 in Line mode (Kerf row).
+Gotcha **35**: the *re-fit* path must apply the `width`/`height` overrides too — the first version used the
+raw `fit_window_size` value in `measure!` and overrode the editor's explicit 340 px width with the
+content's natural cross size (228 px) on the first layout pass; both paths now go through one
+`window_size(fiber)`. Popups are excluded from re-fitting.
+
+**Fill/Offset-Fill preview** (`src/fills.jl`, workspace): scan-mode layers render their closed geometry
+as a region fill with the **even-odd rule** (§3: same-layer overlaps erase, holes empty) — all closed
+rings of a layer are collected first (`PolyLine.closed` only; open paths have no interior) and scanned in
+one pass (`even_odd_runs`: per scan row `y + 0.5`, crossings of every edge, sorted, filled between
+pairs; edges bucketed by first sampled row keep the active list small). The runs are painted into a
+per-layer ARGB8888 software texture (`paint_even_odd!` → `SDL_UpdateTexture`) and blitted beneath the
+strokes via `ctx.texture`. Textures live in Workspace hook state (`Ref(Dict{Int,LayerFillTexture})`),
+keyed by (mode, canvas size, camera matrix, per-layer path ids) — the marching-dashes redraw never
+re-scans an unchanged fill. `offset_fill` previews as the same region fill (the real offset is a machine
+path computed later). `App`/`Workspace` accept a `processes` observable for tests and probes; the panel
+and workspace share it. Verified with `fills_probe.jl`: overlapping rectangles erase their shared strip,
+nested squares leave a hole, an octagon fills solid.
+
+**New gotchas (fills round)**:
+
+36. **`App` injection kwargs are read *after* all `@use` declarations rebind them** — adding a
+    `processes` kwarg is not enough if an old unconditional `processes = processes_internal` line
+    survives below it (the injected observable was overwritten and the panel kept showing defaults).
+    The conditional-rebind block and the legacy assignment must be the same statement; when a probe
+    shows stale state, grep for a second assignment of the injected name.
+
+### 8.12 Tool strip, rectangle tool, and the window-flow fix (2026-10-26)
+
+**Left tool strip** (`ToolsPanel` in `src/app.jl`): LightBurn's creation toolbar for v1 — two icon
+buttons (select ↖ / rectangle ▭; both glyphs added to Rocks' `ICONS`), the active one in the item-hot
+gradient. One shared `tool` observable (`:mouse`/`:rect`) connects the strip and the Workspace
+(injectable for tests like every App prop).
+
+**Rectangle tool** (`src/workspace.jl`, `rect_art` in `document.jl`): pressing starts a creation drag
+(no selection changes in rect mode), motion updates a `rect_drag` observable drawn as a **dashed
+preview** in the active layer's colour (`draw_workspace(preview = …)`), release commits an
+`ArtObject("rectangle", …)` when the drag spans ≥ 0.5 mm — corners normalized, so any drag direction
+works. The new shape is selected; **the tool stays active** (the mouse button switches back), and a
+`no_refit` Ref suppresses the count-refit so creating never refits the view. The canvas shows a
+crosshair while a creation tool is active.
+
+**Rocks: windows stay out of the flow layout** (`src/layout.jl`): `flow_children` now skips **window
+fibers** — a nested window element (the Cuts/Layers editor, a MessageBox, a menu popup) is a screen
+surface positioned by the window manager, never a layout box. Before, the editor window mounted in the
+Form's `children` list joined the scroll flow and its pixel size ate the row heights: the workspace
+Split collapsed 586 → 0 px ("opening the cut options window squishes the main window"). Regression
+test: a host window with a mounted dialog keeps its content sized exactly (gotcha 39).
+
+**Rocks: headless driver module** (`src/driver.jl`, new): the test harness moved into the package —
+`push_event!`/`push_mouse!`/`push_motion!`/`push_wheel!`/`push_key!`/`push_window_event!`,
+`drain_events!`, `with_tree`, `sync_windows!`, plus **tree addressing** (`fibers`, `find_fiber`,
+`find_fibers`, `find_kind`, `collect_kind`, `find_by_key`, `find_by_label` — content matched with the
+renderer's own `text_content`) and **`click!(fiber; clicks, button, at)`** — a full press+release at the
+fiber's center through the real event pipeline (rects are window-absolute, so no coordinate math).
+Tests and probes can now "click through the UI" instead of hand-walking trees; the suite demonstrates
+it end to end (pick the rect tool by its glyph, drag via `push_mouse!`, double-press the process row,
+assert the editor opened and the split kept its height).
+
+**New gotchas**:
+
+37. **`@rock` paren balance in hand-written nested calls** — one `)` too many in a nested
+    `@rock Window(...)` arg list made the `;`-kwargs dangle at function top level ("invalid assignment
+    location "0"", "Expected `end`"), reported against the *macro site* (`element.jl`) instead of the
+    call. Diagnosed with `Meta.parseall` + the JuliaSyntax diagnostics list, mapped to lines via
+    `head -c <byte> | wc -l`. Count parens when a call mixes child elements and `;`-kwargs.
+38. **`click!` on a freshly re-rendered but not re-placed fiber lands at (0, 0)** — the window origin,
+    i.e. the menu bar: rects come from `place!`, not from the reconciler, so a fiber created by a
+    re-render (a new panel row after a doc change) has no placed rect until the next
+    `sync_windows!`/layout pass. After any doc change, sync before clicking.
+39. **`Row`/`Column` are wrapper *components* rendering a `Box`** — the fiber tree is
+    `Column → Box → children`, so tests must not assume a component fiber's children are the written
+    elements (reach one level deeper, or use `find_kind`).
+40. **Drag-created geometry lands on pixel centres** — the tool unprojects rounded canvas pixels, so a
+    dragged rectangle is off by up to 0.5 px / zoom (≈ 0.27 mm at the default fit). Tests assert with
+    `atol ≈ 0.5`; a "snap to grid" option can come later.
