@@ -43,14 +43,169 @@ function DocStatus(; doc = Observable(ArtObject[]), fill = false)
                        panels = Any[E.StatusPanel(text = doc_summary(doc[]))])
 end
 
-function App(; doc = nothing)
+# The Position toolbar: LightBurn's Numeric Edits toolbar (analysis 02 §3.6).
+# The 3×3 origin grid determines the anchor point of the selection's bounding
+# rectangle; X/Y move the selection so the anchor lands on the typed values;
+# W/H scale about the anchor; the lock button makes scaling uniform.
+
+"The 3×3 origin grid: nine small buttons; the active one is highlighted."
+function origin_grid(origin::Observable)
+    t = E.theme()
+    cells = Any[]
+    for row in 1:3, col in 1:3
+        active = origin[] == (col, row)
+        push!(cells, Mechanics.Button(; label = "",
+                                      on_press = () -> origin[] = (col, row),
+                                      width = 12, height = 12, padding = 0,
+                                      gap = 0, radius = 0,
+                                      background = active ? t.colors.selection :
+                                                     t.colors.control,
+                                      border_color = t.colors.border,
+                                      border_width = 1, bevel = :raised))
+    end
+    return @rock Column(
+        @rock Row(cells[1], cells[2], cells[3]; gap = 1),
+        @rock Row(cells[4], cells[5], cells[6]; gap = 1),
+        @rock Row(cells[7], cells[8], cells[9]; gap = 1);
+        gap = 1, align = :center)
+end
+
+function PositionToolbar(; doc = Observable(ArtObject[]),
+                         selection = Observable{Union{Nothing,Int}}(nothing),
+                         origin = Observable((2, 2)),
+                         lock = Observable(false),
+                         fill = false)
+    doc_obs = @use doc
+    selection_obs = @use selection
+    origin_obs = @use origin
+    lock_obs = @use lock
+    t = E.theme()
+
+    # The spinner values, kept in sync with the selection (the anchor point
+    # per the 9-dot grid and the bounding rectangle's size).
+    x_pos = @use Observable(0.0)
+    y_pos = @use Observable(0.0)
+    w_size = @use Observable(0.0)
+    h_size = @use Observable(0.0)
+
+    "The anchor point of `bounds` per the 9-dot grid (row 1 = top)."
+    function anchor_point(bounds)
+        (pmin, pmax) = bounds
+        (col, row) = origin_obs[]
+        x = pmin[1] + (col - 1) / 2 * (pmax[1] - pmin[1])
+        y = row == 1 ? pmax[2] : row == 2 ? (pmin[2] + pmax[2]) / 2 : pmin[2]
+        return Point(x, y)
+    end
+
+    # Keep the spinners in sync when the selection or the document changes.
+    useEffect(() -> begin
+        sel = selection_obs[]
+        if sel !== nothing && 1 <= sel <= length(doc_obs[])
+            bounds = document_bounds([doc_obs[][sel]])
+            if bounds !== nothing
+                (ax, ay) = anchor_point(bounds)
+                x_pos[] = ax
+                y_pos[] = ay
+                w_size[] = bounds[2][1] - bounds[1][1]
+                h_size[] = bounds[2][2] - bounds[1][2]
+            end
+        end
+        nothing
+    end, (doc_obs[], selection_obs[], origin_obs[]))
+
+    "Move the selection so its anchor point lands on `(v, other)`."
+    function move_to!(v, axis)
+        sel = selection_obs[]
+        (sel !== nothing && 1 <= sel <= length(doc_obs[])) || return
+        art = doc_obs[][sel]
+        bounds = document_bounds([art])
+        bounds === nothing && return
+        (ax, ay) = anchor_point(bounds)
+        dx = axis == :x ? v - ax : 0.0
+        dy = axis == :y ? v - ay : 0.0
+        d = copy(doc_obs[])
+        d[sel] = translate(art, dx, dy)
+        doc_obs[] = d
+        return nothing
+    end
+
+    "Scale the selection so its size along `axis` becomes `v`, anchored at
+    the 9-dot anchor; the lock makes scaling uniform."
+    function resize_to!(v, axis)
+        sel = selection_obs[]
+        (sel !== nothing && 1 <= sel <= length(doc_obs[])) || return
+        art = doc_obs[][sel]
+        bounds = document_bounds([art])
+        bounds === nothing && return
+        anchor = anchor_point(bounds)
+        old_w = max(bounds[2][1] - bounds[1][1], 1e-6)
+        old_h = max(bounds[2][2] - bounds[1][2], 1e-6)
+        sx = axis == :w ? v / old_w : 1.0
+        sy = axis == :h ? v / old_h : 1.0
+        if lock_obs[]
+            axis == :w ? (sy = sx) : (sx = sy)
+        end
+        d = copy(doc_obs[])
+        d[sel] = scale(art, sx, sy, anchor)
+        doc_obs[] = d
+        return nothing
+    end
+
+    # The 3×3 origin grid.
+    grid = origin_grid(origin_obs)
+
+    # The lock button: highlighted while the aspect ratio is locked.
+    lock_btn = Mechanics.Button(; label = "Lock",
+                                on_press = () -> lock_obs[] = !lock_obs[],
+                                width = 46, height = t.metrics.input_height,
+                                padding = 4, gap = 0, radius = 0,
+                                background = lock_obs[] ? t.colors.selection :
+                                               t.colors.control,
+                                text_color = t.colors.text,
+                                border_color = t.colors.border, border_width = 1,
+                                size = t.metrics.font_size - 2, font = t.font,
+                                bevel = :raised)
+    axis_label(text) = @rock Box(@rock E.Label(text);
+                                 width = 16, align = :center, direction = :row)
+    # A labelled spinner: the label to its left; edits apply to the selection.
+    spinner_row(label, obs, apply, step = 1.0) = @rock Row(
+        axis_label(label),
+        (@rock E.Spinner(value = obs, step = step, width = 90,
+                         on_change = v -> begin
+                             println("DBG apply ", label, ": ", v)
+                             apply(v)
+                         end));
+        gap = 4, align = :center)
+    # X/Y and W/H stacked vertically; the lock button right of the W/H column.
+    xy_column = @rock Column(
+        spinner_row("X", x_pos, v -> move_to!(v, :x)),
+        spinner_row("Y", y_pos, v -> move_to!(v, :y)); gap = 2)
+    wh_column = @rock Column(
+        spinner_row("W", w_size, v -> resize_to!(v, :w)),
+        spinner_row("H", h_size, v -> resize_to!(v, :h)); gap = 2)
+    return @rock Box(
+        grid,
+        xy_column,
+        wh_column,
+        @rock Box(lock_btn; align = :center, direction = :row);
+        direction = :row, gap = 10, padding = 3, align = :center,
+        background = t.gradients.toolbar, fill = fill)
+end
+
+function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
-    # into a dead instance. `doc` may be supplied by the caller (tests embed
-    # their own); then the internal one is unused.
+    # into a dead instance. `doc`/`selection` may be supplied by the caller
+    # (tests embed their own); then the internal ones are unused.
     doc_internal = @use Observable(ArtObject[])
     doc = doc === nothing ? doc_internal : doc
+    selection_internal = @use Observable{Union{Nothing,Int}}(nothing)
+    selection = selection === nothing ? selection_internal : selection
+    origin_internal = @use Observable((2, 2))
+    origin = origin === nothing ? origin_internal : origin
+    lock_internal = @use Observable(false)
+    lock = lock === nothing ? lock_internal : lock
     pending_open = @use Observable{Union{Nothing,FileDialogResult}}(nothing)
     error_open = @use Observable(false)
     last_error = @use Observable("")
@@ -96,10 +251,11 @@ function App(; doc = nothing)
         title = "BlazeCraft",
         width = SHELL_WIDTH, height = SHELL_HEIGHT, padding = 0,
         menu = menu,
+        toolbar = (@rock PositionToolbar(doc = doc, selection = selection,
+                                         origin = origin, lock = lock)),
         status = (@rock DocStatus(doc = doc)),
         children = Any[
-            (@rock Workspace(
-                doc = doc;
+            (@rock Workspace(doc = doc, selection = selection;
                 flex = 1, fill = true, height = "100%")),
             (@rock E.MessageBox(open = error_open, title = "Import failed",
                                 message = last_error[], icon = :warning)),

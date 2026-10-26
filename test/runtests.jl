@@ -2,8 +2,10 @@ using Test
 using BlazeCraftGUI
 using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
+                    translate, scale, rotate, hit_shape,
                     layer_color, ArtObject
 using BlazeCraft.Shapes: PolyLine, Point
+using StaticArrays: SVector
 using StaticArrays: SVector
 
 @testset "document model" begin
@@ -83,6 +85,37 @@ using StaticArrays: SVector
             @test center_on_workarea(ArtObject[]) == ArtObject[]
         end
     end
+end
+
+@testset "editing helpers" begin
+    art = ArtObject("s", [PolyLine([Point(0.0, 0.0), Point(10.0, 0.0)], false)],
+                    (0, 0, 0))
+    # translate moves every point
+    moved = translate(art, 5.0, -2.0)
+    @test moved.paths[1].points == [Point(5.0, -2.0), Point(15.0, -2.0)]
+    # scale about an anchor keeps the anchor fixed
+    scaled = scale(art, 2.0, 2.0, Point(0.0, 0.0))
+    @test scaled.paths[1].points == [Point(0.0, 0.0), Point(20.0, 0.0)]
+    scaled2 = scale(art, 2.0, 2.0, Point(10.0, 0.0))
+    # The anchor (10, 0) stays fixed; the other point stretches away.
+    @test scaled2.paths[1].points == [Point(-10.0, 0.0), Point(10.0, 0.0)]
+    # rotate by 90° about (0,0) maps +x to +y
+    rotated = rotate(art, π / 2, Point(0.0, 0.0))
+    @test rotated.paths[1].points[2][1] ≈ 0.0 atol = 1e-12
+    @test rotated.paths[1].points[2][2] ≈ 10.0 atol = 1e-12
+end
+
+@testset "hit_shape" begin
+    box = ArtObject("box", [PolyLine([Point(10.0, 10.0), Point(50.0, 10.0),
+                                      Point(50.0, 50.0), Point(10.0, 50.0)],
+                                     true)], (0, 0, 0))
+    tri = ArtObject("tri", [PolyLine([Point(200.0, 200.0), Point(240.0, 200.0),
+                                      Point(220.0, 240.0)], true)], (0, 0, 0))
+    m = matrix(Camera((0.0, 0.0), 0.0, 2.0))
+    # 2 px/mm: world (220, 200) is canvas (440, -400)
+    @test hit_shape(m, [box, tri], 440.0, -400.0, 4.0) == 2
+    @test hit_shape(m, [box, tri], 30.0, -20.0, 4.0) == 1
+    @test hit_shape(m, [box, tri], 150.0, -150.0, 4.0) === nothing
 end
 
 @testset "camera" begin

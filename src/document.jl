@@ -92,6 +92,51 @@ function import_art(path::AbstractString)
 end
 
 """
+    translate(art, dx, dy) -> ArtObject
+
+Move an art object by `dx`/`dy` millimetres.
+"""
+function translate(art::ArtObject, dx::Float64, dy::Float64)
+    return ArtObject(art.name,
+                     [PolyLine([Point(p[1] + dx, p[2] + dy) for p in pl.points],
+                               pl.closed) for pl in art.paths],
+                     art.color)
+end
+
+"""
+    scale(art, sx, sy, anchor) -> ArtObject
+
+Scale an art object by `sx`/`sy` about `anchor` (which stays fixed).
+"""
+function scale(art::ArtObject, sx::Float64, sy::Float64, anchor::Point)
+    return ArtObject(art.name,
+                     [PolyLine([Point(anchor[1] + (p[1] - anchor[1]) * sx,
+                                      anchor[2] + (p[2] - anchor[2]) * sy)
+                                for p in pl.points], pl.closed)
+                      for pl in art.paths],
+                     art.color)
+end
+
+"""
+    rotate(art, angle, center) -> ArtObject
+
+Rotate an art object by `angle` radians (counterclockwise in world
+coordinates) about `center`.
+"""
+function rotate(art::ArtObject, angle::Float64, center::Point)
+    co, si = cos(angle), sin(angle)
+    return ArtObject(art.name,
+                     [PolyLine([begin
+                                    dx = p[1] - center[1]
+                                    dy = p[2] - center[2]
+                                    Point(center[1] + dx * co - dy * si,
+                                          center[2] + dx * si + dy * co)
+                                end for p in pl.points], pl.closed)
+                      for pl in art.paths],
+                     art.color)
+end
+
+"""
     center_on_workarea(arts) -> Vector{ArtObject}
 
 Translate newly imported art so the union of its bounds sits centered on the

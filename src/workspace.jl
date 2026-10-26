@@ -87,14 +87,155 @@ function draw_segment(ctx, m, segment; color, width)
 end
 
 """
-    draw_workspace(ctx, camera, doc)
+    draw_dashed_polyline(ctx, pts; color, width, dash, gap, phase, closed)
 
-Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm
-grid with thicker 100 mm majors, and the document's outlines, one stroke
-color per layer. `doc` is the list of `BlazeCraftGUI.ArtObject`s; `camera`
-is the `BlazeCraftGUI.Camera` for this frame.
+Draw a polyline as dashes of `dash` px separated by `gap` px gaps, shifted by
+`phase` px along the path (the marching-dashes animation). `closed` draws the
+closing segment back to the first point.
 """
-function draw_workspace(ctx, camera, doc)
+function draw_dashed_polyline(ctx, pts; color = (0.0, 0.0, 0.0), width = 1.0,
+                              dash = 6.0, gap = 4.0, phase = 0.0, closed = false)
+    period = dash + gap
+    travelled = 0.0
+    n = length(pts)
+    for i in 1:(closed ? n : n - 1)
+        a, b = pts[i], pts[mod1(i + 1, n)]
+        len = hypot(b[1] - a[1], b[2] - a[2])
+        len == 0 && continue
+        ux, uy = (b[1] - a[1]) / len, (b[2] - a[2]) / len
+        pos = 0.0
+        while pos < len
+            offset = mod(travelled + pos - phase, period)
+            if offset < dash
+                # The 1e-6 floor guarantees progress: when the pattern
+                # boundary lands exactly on `pos`, a zero advance would spin
+                # forever on paths with many tiny segments.
+                stop = min(len, pos + max(dash - offset, 1e-6))
+                ctx.line(a[1] + ux * pos, a[2] + uy * pos,
+                         a[1] + ux * stop, a[2] + uy * stop;
+                         color = color, width = width)
+                pos = stop
+            else
+                pos = min(len, pos + max(period - offset, 1e-6))
+            end
+        end
+        travelled += len
+    end
+    return nothing
+end
+
+"""
+    _segment_distance(p, a, b)
+
+Distance from point `p` to the segment `a`–`b` (world millimetres).
+"""
+function _segment_distance(p, a, b)
+    ab = b - a
+    len2 = ab[1]^2 + ab[2]^2
+    len2 == 0 && return hypot(p[1] - a[1], p[2] - a[2])
+    t = clamp(((p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / len2, 0.0, 1.0)
+    return hypot(p[1] - (a[1] + t * ab[1]), p[2] - (a[2] + t * ab[2]))
+end
+
+"""
+    hit_shape(m, doc, x, y, threshold)
+
+The index of the shape whose outline passes within `threshold` millimetres of
+the canvas-local point `(x, y)` (unprojected through the camera matrix), or
+`nothing`. Later shapes win.
+"""
+function hit_shape(m, doc, x, y, threshold)
+    w = inv(m) * SVector(x, y, 1.0)
+    p = SVector(w[1], w[2])
+    for (idx, obj) in enumerate(doc)
+        for pl in obj.paths
+            for i in 1:(length(pl.points) - 1)
+                _segment_distance(p, pl.points[i], pl.points[i + 1]) <= threshold &&
+                    return idx
+            end
+            if pl.closed && length(pl.points) > 2 &&
+               _segment_distance(p, pl.points[end], pl.points[1]) <= threshold
+                return idx
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+    selection_bbox(m, doc, idx) -> (x0, y0, x1, y1)
+
+The selected shape's bounding rectangle in canvas-local pixels (y-down), or
+`nothing`.
+"""
+function selection_bbox(m, doc, idx)
+    1 <= idx <= length(doc) || return nothing
+    bounds = document_bounds([doc[idx]])
+    bounds === nothing && return nothing
+    c1 = apply(m, SVector(bounds[1][1], bounds[1][2]))
+    c2 = apply(m, SVector(bounds[2][1], bounds[2][2]))
+    return (min(c1[1], c2[1]), min(c1[2], c2[2]),
+            max(c1[1], c2[1]), max(c1[2], c2[2]))
+end
+
+"The handle square size in px."
+const HANDLE_PX = 9.0
+"The offset of the rotation handles outside the bbox corners, in px."
+const ROTATE_OFFSET_PX = 18.0
+
+"""
+    selection_handles(bbox) -> NamedTuple
+
+Screen-space positions of the selection handles: four corner scale handles,
+the center translate handle and four rotation handles outside the corners.
+"""
+function selection_handles(bbox)
+    (x0, y0, x1, y1) = bbox
+    dlen = hypot(x1 - x0, y1 - y0)
+    ux, uy = dlen == 0 ? (0.0, 0.0) : ((x1 - x0) / dlen, (y1 - y0) / dlen)
+    return (corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+            center = ((x0 + x1) / 2, (y0 + y1) / 2),
+            rotate = [(x0 - ux * ROTATE_OFFSET_PX, y0 - uy * ROTATE_OFFSET_PX),
+                      (x1 + ux * ROTATE_OFFSET_PX, y0 - uy * ROTATE_OFFSET_PX),
+                      (x1 + ux * ROTATE_OFFSET_PX, y1 + uy * ROTATE_OFFSET_PX),
+                      (x0 - ux * ROTATE_OFFSET_PX, y1 + uy * ROTATE_OFFSET_PX)])
+end
+
+"The handle under the canvas-local point, or `nothing`."
+function handle_at(handles, x, y)
+    s = HANDLE_PX / 2 + 1.0
+    for (i, (hx, hy)) in enumerate(handles.corners)
+        abs(x - hx) <= s && abs(y - hy) <= s && return Symbol("scale_$i")
+    end
+    (hx, hy) = handles.center
+    abs(x - hx) <= s && abs(y - hy) <= s && return :translate
+    for (i, (hx, hy)) in enumerate(handles.rotate)
+        abs(x - hx) <= s && abs(y - hy) <= s && return Symbol("rotate_$i")
+    end
+    return nothing
+end
+
+"A square transform handle drawn at a screen position."
+function draw_handle(ctx, x, y; fill = (1.0, 1.0, 1.0), border = (0.1, 0.1, 0.1))
+    s = HANDLE_PX / 2
+    ctx.polygon([(x - s, y - s), (x + s, y - s), (x + s, y + s), (x - s, y + s)];
+                color = fill)
+    for (a, b, c, d) in [(x - s, y - s, x + s, y - s), (x - s, y + s, x + s, y + s),
+                         (x - s, y - s, x - s, y + s), (x + s, y - s, x + s, y + s)]
+        ctx.line(a, b, c, d; color = border, width = 1.0)
+    end
+    return nothing
+end
+
+"""
+    draw_workspace(ctx, camera, doc, selection, dash_phase)
+
+Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm grid
+with thicker 100 mm majors, the document's outlines (one stroke color per
+layer) — and, when a shape is selected, its marching-dash outline, a dashed
+bounding box and the transform handles.
+"""
+function draw_workspace(ctx, camera, doc, selection, dash_phase)
     _, _, cw, ch = ctx.rect
     m = matrix(camera)
     ctx.clear((0.86, 0.87, 0.89))          # tone outside the work area
@@ -118,11 +259,47 @@ function draw_workspace(ctx, camera, doc)
         draw_segment(ctx, m, segment; color = (0.55, 0.60, 0.65), width = 1.0)
     end
 
-    for obj in doc
-        for pl in obj.paths
+    for (idx, obj) in enumerate(doc)
+        selected = selection !== nothing && idx == selection
+        for (path_index, pl) in enumerate(obj.paths)
             length(pl.points) < 2 && continue
-            ctx.polyline([apply(m, p) for p in pl.points];
-                         color = obj.color, width = 1, closed = pl.closed)
+            pts = [apply(m, p) for p in pl.points]
+            if selected
+                # Each curve starts at its own position in the dash pattern
+                # (spread by the golden-ratio modulus, stable across frames),
+                # so short curves don't all flash in sync as the phase moves.
+                draw_dashed_polyline(ctx, pts; color = (0.15, 0.35, 0.9),
+                                     width = 2.0,
+                                     phase = dash_phase + mod(path_index * 2.399963, 10.0),
+                                     closed = pl.closed)
+            else
+                ctx.polyline(pts; color = obj.color, width = 1, closed = pl.closed)
+            end
+        end
+    end
+
+    # The selection decoration: dashed bounding box, transform handles.
+    if selection !== nothing
+        bbox = selection_bbox(m, doc, selection)
+        if bbox !== nothing
+            handles = selection_handles(bbox)
+            (x0, y0, x1, y1) = bbox
+            draw_dashed_polyline(ctx, [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
+                                 color = (0.15, 0.35, 0.9), width = 1.0,
+                                 dash = 4.0, gap = 3.0, phase = dash_phase)
+            # Thin lines from the corners out to the rotation handles.
+            for (corner, rot) in zip(handles.corners, handles.rotate)
+                ctx.line(corner[1], corner[2], rot[1], rot[2];
+                         color = (0.15, 0.35, 0.9), width = 1.0)
+            end
+            for (hx, hy) in handles.rotate
+                draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
+            end
+            for (hx, hy) in handles.corners
+                draw_handle(ctx, hx, hy)
+            end
+            (hx, hy) = handles.center
+            draw_handle(ctx, hx, hy; fill = (0.15, 0.35, 0.9))
         end
     end
     return nothing
@@ -153,18 +330,25 @@ function fit_camera(cw, ch, doc)
 end
 
 """
-    Workspace(; doc, props...)
+    Workspace(; doc, selection, props...)
 
 The interactive workspace. `doc` is an `Observable{Vector{ArtObject}}` owned
-by the app; the workspace refits the view whenever the document changes and
-supports pan (drag) and wheel-zoom-at-cursor. Layout props (`flex`, `fill`,
-`height`, …) given to the component are forwarded onto the `MouseArea` —
-inside a `Form`'s scroll column the component needs
-`flex = 1, fill = true, height = "100%"` to fill the client area, because the
-scroll content never gives `flex` extra space to grow into.
+by the app and `selection` an `Observable{Union{Nothing,Int}}` (the selected
+shape's index). Clicking one of a shape's lines selects it; the selection
+shows a marching-dash outline, a dashed bounding box and transform handles
+(corner squares scale, the center square translates, the outside rotation
+handles rotate). The workspace also supports pan (drag on empty space) and
+wheel-zoom-at-cursor, and refits the view when a new import changes the
+object count. Layout props (`flex`, `fill`, `height`, …) given to the
+component are forwarded onto the `MouseArea` — inside a `Form`'s scroll
+column the component needs `flex = 1, fill = true, height = "100%"` to fill
+the client area, because the scroll content never gives `flex` extra space
+to grow into.
 """
-function Workspace(; doc = Observable(ArtObject[]), props...)
+function Workspace(; doc = Observable(ArtObject[]),
+                   selection = Observable{Union{Nothing,Int}}(nothing), props...)
     doc_obs = @use doc
+    selection_obs = @use selection
 
     # View state: the camera, as hook state, so it survives the per-frame
     # body re-runs. Writes trigger a (draw-marked) re-render.
@@ -172,16 +356,41 @@ function Workspace(; doc = Observable(ArtObject[]), props...)
 
     # Silent hook state (stable across re-renders, no re-render on write).
     fit_pending = @use Ref(true)
-    dragging = @use Ref(false)
+    fit_count = @use Ref(-1)
+    # The active drag: the mode (:translate/:scale_N/:rotate_N), the dragged
+    # shape's original geometry, its original world bbox and the start point.
+    drag_mode = @use Ref(:none)
+    drag_art = @use Ref{Any}(nothing)
+    drag_bbox = @use Ref{Any}(nothing)
     drag_start = @use Ref((0.0, 0.0))
 
-    # Refit whenever the document changes (the effect re-runs with a new
-    # doc list). The flag is then consumed by the first following draw,
-    # where the canvas size is known.
+    # Refit when a new import changes the object count (an edit keeps the
+    # count, so moving/scaling a shape never refits the view).
     useEffect(() -> begin
-        fit_pending[] = true
+        count = length(doc_obs[])
+        if count != fit_count[]
+            fit_count[] = count
+            fit_pending[] = true
+        end
         nothing
     end, (doc_obs[],))
+
+    # The marching-dashes animation: a 100 ms tick marks the windows for a
+    # draw-only redraw (the draw callbacks re-issue their primitives, no
+    # component re-runs) while a shape is selected. The dash phase is derived
+    # from the clock in the draw callback — no state, no re-render.
+    useInterval(() -> begin
+        selection_obs[] !== nothing && Rocks.request_redraw()
+        nothing
+    end, 100)
+
+    "Write a modified copy of the shape at `idx` back into the document."
+    function replace_art!(idx, art)
+        d = copy(doc_obs[])
+        d[idx] = art
+        doc_obs[] = d
+        return nothing
+    end
 
     return @rock MouseArea(
         @rock Canvas(
@@ -193,25 +402,87 @@ function Workspace(; doc = Observable(ArtObject[]), props...)
                     view[] = camera
                     fit_pending[] = false
                 end
-                draw_workspace(ctx, camera, doc_obs[])
+                draw_workspace(ctx, camera, doc_obs[], selection_obs[],
+                               mod(time() * 20.0, 10.0))
             end,
             # The bed tone distinguishes the canvas from the desktop gray
             # that Tools panels use in Rocks' Enterprise theme.
             background = (0.86, 0.87, 0.89), fill = true);
         on_down = (x, y, _) -> begin
-            drag_start[] = (view[].translation[1] - x,
-                            view[].translation[2] - y)
-            dragging[] = true
+            sel = selection_obs[]
+            # 1. Transform handles of the current selection.
+            if sel !== nothing
+                bbox = selection_bbox(matrix(view[]), doc_obs[], sel)
+                if bbox !== nothing
+                    handle = handle_at(selection_handles(bbox), x, y)
+                    if handle !== nothing
+                        drag_mode[] = handle
+                        drag_art[] = doc_obs[][sel]
+                        drag_bbox[] = bbox
+                        drag_start[] = (x, y)
+                        return nothing
+                    end
+                end
+            end
+            # 2. Select a shape by clicking one of its lines; empty space deselects.
+            selection_obs[] = hit_shape(matrix(view[]), doc_obs[], x, y,
+                                        8.0 / view[].scale)
+            return nothing
         end,
-        # `on_move` also fires on plain hover; the dragging flag gates pan.
-        # The drag stores the grab offset, so the new translation is
-        # `start + (x, y)` — set directly, not as a delta.
+        # `on_move` also fires on plain hover; the drag mode gates the work.
+        # All drag math happens in world coordinates: the screen positions
+        # (the drag start, the cursor, the handle corners) are unprojected
+        # through the inverse camera matrix.
         on_move = (x, y) -> begin
-            dragging[] || return nothing
-            view[] = Camera(SVector(drag_start[][1] + x, drag_start[][2] + y),
-                            view[].rotation, view[].scale)
+            mode = drag_mode[]
+            mode == :none && return nothing
+            sel = selection_obs[]
+            sel === nothing && return nothing
+            inv_m = inv(matrix(view[]))
+            if mode == :translate
+                sw = inv_m * SVector(drag_start[][1], drag_start[][2], 1.0)
+                cw = inv_m * SVector(x, y, 1.0)
+                replace_art!(sel, translate(drag_art[], cw[1] - sw[1],
+                                            cw[2] - sw[2]))
+            elseif startswith(string(mode), "scale_")
+                # The dragged corner moves to the cursor; the opposite corner
+                # of the original bbox stays fixed.
+                i = parse(Int, string(mode)[7:end])
+                bbox = drag_bbox[]
+                corners = [(bbox[1], bbox[2]), (bbox[3], bbox[2]),
+                           (bbox[3], bbox[4]), (bbox[1], bbox[4])]
+                (cx_s, cy_s) = corners[i]
+                (ox_s, oy_s) = corners[mod1(i + 2, 4)]
+                cw0 = inv_m * SVector(cx_s, cy_s, 1.0)   # dragged corner, world
+                ow0 = inv_m * SVector(ox_s, oy_s, 1.0)   # opposite corner, world
+                cw = inv_m * SVector(x, y, 1.0)          # cursor, world
+                sx = abs(cw0[1] - ow0[1]) < 1e-9 ? 1.0 :
+                     (cw[1] - ow0[1]) / (cw0[1] - ow0[1])
+                sy = abs(cw0[2] - ow0[2]) < 1e-9 ? 1.0 :
+                     (cw[2] - ow0[2]) / (cw0[2] - ow0[2])
+                (abs(sx) > 1e-6 && abs(sy) > 1e-6) || return nothing
+                replace_art!(sel, scale(drag_art[], sx, sy,
+                                        SVector(ow0[1], ow0[2])))
+            elseif startswith(string(mode), "rotate_")
+                # Rotate around the selection's bbox center by the angle
+                # between the drag start and the cursor.
+                bbox = drag_bbox[]
+                cc = inv_m * SVector((bbox[1] + bbox[3]) / 2,
+                                     (bbox[2] + bbox[4]) / 2, 1.0)
+                sw = inv_m * SVector(drag_start[][1], drag_start[][2], 1.0)
+                cw = inv_m * SVector(x, y, 1.0)
+                a0 = atan(sw[2] - cc[2], sw[1] - cc[1])
+                a1 = atan(cw[2] - cc[2], cw[1] - cc[1])
+                replace_art!(sel, rotate(drag_art[], a1 - a0,
+                                         SVector(cc[1], cc[2])))
+            end
+            return nothing
         end,
-        on_up = (_, _, _) -> (dragging[] = false),
+        on_up = (_, _, _) -> begin
+            drag_mode[] = :none
+            drag_art[] = nothing
+            return nothing
+        end,
         on_wheel = (dx, dy, x, y) -> (view[] = zoom_at(view[], x, y, 1.15^dy)),
         props...,
         # Inside a Form's scroll column `flex` has no height to grow into:

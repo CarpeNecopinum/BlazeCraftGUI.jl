@@ -19,7 +19,7 @@ include("app.jl")
 "Run the app window (headless runs accept `frames = n, screenshot = \"…\"`)."
 run_gui(; kw...) = render(App; kw...)
 
-export App, ArtObject, import_art, center_on_workarea, run_gui, FileDialogResult,
-       show_open_file_dialog!
+export App, ArtObject, import_art, center_on_workarea, translate, scale, rotate,
+       run_gui, FileDialogResult, show_open_file_dialog!
 
 end # module
