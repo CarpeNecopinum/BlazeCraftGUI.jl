@@ -167,14 +167,15 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
                                 bevel = :raised)
     axis_label(text) = @rock Box(@rock E.Label(text);
                                  width = 16, align = :center, direction = :row)
+    # The translate/scale inputs only act on a selection; with none they are
+    # grayed out. (The toolbar re-renders on selection changes.)
+    has_sel = selection_obs[] !== nothing &&
+              1 <= selection_obs[] <= length(doc_obs[])
     # A labelled spinner: the label to its left; edits apply to the selection.
     spinner_row(label, obs, apply, step = 1.0) = @rock Row(
         axis_label(label),
         (@rock E.Spinner(value = obs, step = step, width = 90,
-                         on_change = v -> begin
-                             println("DBG apply ", label, ": ", v)
-                             apply(v)
-                         end));
+                         on_change = apply, disabled = !has_sel));
         gap = 4, align = :center)
     # X/Y and W/H stacked vertically; the lock button right of the W/H column.
     xy_column = @rock Column(

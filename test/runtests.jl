@@ -1,5 +1,6 @@
 using Test
 using BlazeCraftGUI
+import Rocks
 using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
                     translate, scale, rotate, hit_shape,
@@ -188,5 +189,66 @@ end
         # The bed's far corner is inside the canvas, too.
         x, y = apply(matrix(cam), Point(300.0, 300.0))
         @test 0 <= x <= 720 && 0 <= y <= 500
+    end
+end
+
+using Rocks: Observable
+
+@testset "position toolbar" begin
+    pl = PolyLine([Point(10.0, 10.0), Point(60.0, 10.0), Point(60.0, 40.0),
+                   Point(10.0, 40.0)], true)
+    art = ArtObject("box", [pl], layer_color(0))
+
+    "Collect the pressable fibers of the subtree rooted at `f`."
+    function pressables(f, out = Rocks.Fiber[])
+        f.kind === Rocks.Pressable && push!(out, f)
+        foreach(c -> pressables(c, out), f.children)
+        out
+    end
+
+    "Render the toolbar with `sel_mm`; run `f` on the tree."
+    function with_toolbar(f, selection)
+        doc = Observable([art])
+        app = () -> (Rocks.@rock PositionToolbar(
+            doc = doc, selection = selection,
+            origin = Observable((2, 2)), lock = Observable(false)))
+        Rocks.RUNNING[] = true
+        Rocks.DIRTY[] = true
+        Rocks.init_backend()
+        tree = Rocks.create_root(app, (;))
+        Rocks.perform_render!(tree)
+        Rocks.run_effects!()
+        Rocks.flush_dirty!()
+        try
+            f(tree)
+        finally
+            Rocks.RUNNING[] = false
+            Rocks.unmount!(tree)
+            Rocks.shutdown_backend()
+        end
+    end
+
+    @testset "nothing selected: inputs disabled" begin
+        with_toolbar(Observable{Union{Nothing,Int}}(nothing)) do tree
+            ps = pressables(tree)
+            # The spinner fields drop their keyboard-handler props, so no
+            # pressable handles text input.
+            fields = filter(p -> haskey(p.props, :on_text_input), ps)
+            @test isempty(fields)
+            # Editing input does nothing: apply writes are guarded too — the
+            # spinner arrows must be no-ops.
+            disabled = filter(p -> get(p.props, :disabled, false), ps)
+            @test length(disabled) >= 4
+        end
+    end
+
+    @testset "selection present: inputs enabled and synced" begin
+        with_toolbar(Observable{Union{Nothing,Int}}(1)) do tree
+            ps = pressables(tree)
+            fields = filter(p -> haskey(p.props, :on_text_input), ps)
+            @test length(fields) == 4
+            # No grayed out arrows with a live selection.
+            @test !any(p -> get(p.props, :disabled, false), ps)
+        end
     end
 end
