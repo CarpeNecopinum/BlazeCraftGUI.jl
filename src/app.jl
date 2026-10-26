@@ -43,6 +43,48 @@ function DocStatus(; doc = Observable(ArtObject[]), fill = false)
                        panels = Any[E.StatusPanel(text = doc_summary(doc[]))])
 end
 
+# The layer bar: LightBurn's Color Palette along the bottom (analysis 02 §4).
+# The swatches are the palette layers `00`–`29` plus the `T1`/`T2` tool
+# layers. Clicking a swatch assigns its layer to the selected objects — with
+# nothing selected it becomes the colour for newly created shapes.
+function LayerBar(; doc = Observable(ArtObject[]),
+                  selection = Observable{Union{Nothing,Int}}(nothing),
+                  active_layer = Observable(0), fill = false)
+    doc_obs = @use doc
+    selection_obs = @use selection
+    active_obs = @use active_layer
+    t = E.theme()
+
+    "Recolour the selection to layer `l` and make it the colour for newly
+    created shapes (LightBurn's palette click behaviour)."
+    set_layer!(l) = begin
+        sel = selection_obs[]
+        if sel !== nothing && 1 <= sel <= length(doc_obs[])
+            d = copy(doc_obs[])
+            d[sel] = first(set_layer([doc_obs[][sel]], l))
+            doc_obs[] = d
+        end
+        active_obs[] = l
+        return nothing
+    end
+
+    # A palette chip: the layer colour as a raised square; the active one
+    # (colour for new shapes) carries the selection-colour border. Tool
+    # layers get a tiny T1/T2 caption since they act differently.
+    chip(l) = Mechanics.Button(;
+        label = is_tool_layer(l) ? layer_label(l) : "",
+        on_press = () -> set_layer!(l),
+        width = 16, height = 16, padding = 0, gap = 0, radius = 4,
+        background = layer_color(l),
+        text_color = (0.05, 0.05, 0.05), size = 6, font = t.font,
+        border_color = active_obs[] == l ? t.colors.selection :
+                                           t.colors.border,
+        border_width = active_obs[] == l ? 2 : 1, bevel = :raised)
+
+    chips = Any[chip(l) for l in 0:(CUT_LAYERS + 1)]
+    return E.StatusBar(grip = false, fill = fill, panels = chips)
+end
+
 # The Position toolbar: LightBurn's Numeric Edits toolbar (analysis 02 §3.6).
 # The 3×3 origin grid determines the anchor point of the selection's bounding
 # rectangle; X/Y move the selection so the anchor lands on the typed values;
@@ -193,7 +235,8 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
         background = t.gradients.toolbar, fill = fill)
 end
 
-function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing)
+function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing,
+             active_layer = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
@@ -207,6 +250,10 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     origin = origin === nothing ? origin_internal : origin
     lock_internal = @use Observable(false)
     lock = lock === nothing ? lock_internal : lock
+    # The active palette layer: the colour for newly created shapes (§4). v1
+    # has no creation tools yet — the state and the bar highlight exist now.
+    active_internal = @use Observable(0)
+    active_layer = active_layer === nothing ? active_internal : active_layer
     pending_open = @use Observable{Union{Nothing,FileDialogResult}}(nothing)
     error_open = @use Observable(false)
     last_error = @use Observable("")
@@ -225,7 +272,7 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
             errs = String[]
             for path in pending.paths
                 try
-                    push!(arts, import_art(path))
+                    append!(arts, import_art(path))
                 catch err
                     push!(errs, string(basename(path), ": ",
                                        sprint(showerror, err)))
@@ -254,7 +301,10 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
         menu = menu,
         toolbar = (@rock PositionToolbar(doc = doc, selection = selection,
                                          origin = origin, lock = lock)),
-        status = (@rock DocStatus(doc = doc)),
+        status = (@rock Row(DocStatus(doc = doc), (@rock Box(; flex = 1)),
+                            LayerBar(doc = doc, selection = selection,
+                                     active_layer = active_layer);
+                            gap = 6, align = :center)),
         children = Any[
             (@rock Workspace(doc = doc, selection = selection;
                 flex = 1, fill = true, height = "100%")),

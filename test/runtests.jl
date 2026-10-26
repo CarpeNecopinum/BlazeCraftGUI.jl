@@ -11,12 +11,23 @@ using StaticArrays: SVector
 
 @testset "document model" begin
     @testset "import_art: svg" begin
-        art = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
         @test art.name == "shapes.svg"
+        # SVG carries no layer information: everything on the default layer.
+        @test art.layer == 0
         @test length(art.paths) == 3
         # Coordinates are millimetres, y-up (importer flips SVG's y-down).
         ys = [p[2] for pl in art.paths for p in pl.points]
         @test maximum(ys) <= 0  # the file sits below the origin after the flip
+    end
+
+    @testset "import_art: dxf layers split" begin
+        arts = import_art(joinpath(@__DIR__, "..", "example.dxf"))
+        @test length(arts) >= 2
+        # One palette layer per DXF source layer, assigned in sorted name
+        # order (`00` on), named "file/layer".
+        @test [a.layer for a in arts] == collect(0:length(arts) - 1)
+        @test all(a -> occursin('/', a.name), arts)
     end
 
     @testset "import_art: errors" begin
@@ -26,7 +37,7 @@ using StaticArrays: SVector
 
     @testset "document_bounds" begin
         @test document_bounds(ArtObject[]) === nothing
-        art = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
         b = document_bounds([art])
         @test b !== nothing
         (pmin, pmax) = b
@@ -43,13 +54,13 @@ using StaticArrays: SVector
 
     @testset "doc_summary" begin
         @test occursin("File", doc_summary(ArtObject[]))
-        art = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
         @test doc_summary([art]) == "shapes.svg: 3 outlines"
     end
 
     @testset "center_on_workarea" begin
         @testset "single object centers its bounds on the work area" begin
-            art = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+            art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
             (pmin, pmax) = document_bounds([art])
             before_w = pmax[1] - pmin[1]
             before_h = pmax[2] - pmin[2]
@@ -66,9 +77,9 @@ using StaticArrays: SVector
         @testset "multiple objects center together, keeping relative positions" begin
             box = ArtObject("box", [PolyLine([Point(0.0, 0.0), Point(40.0, 0.0),
                                               Point(40.0, 20.0), Point(0.0, 20.0)],
-                                             true)], layer_color(0))
+                                             true)], 0)
             tri = ArtObject("tri", [PolyLine([Point(60.0, 30.0), Point(80.0, 30.0),
-                                              Point(70.0, 50.0)], false)], layer_color(0))
+                                              Point(70.0, 50.0)], false)], 0)
             gap_before = 60.0 - 40.0   # x distance between the two bounds
             centered = center_on_workarea([box, tri])
             (pmin, pmax) = document_bounds(centered)
@@ -90,7 +101,7 @@ end
 
 @testset "editing helpers" begin
     art = ArtObject("s", [PolyLine([Point(0.0, 0.0), Point(10.0, 0.0)], false)],
-                    (0, 0, 0))
+                    0)
     # translate moves every point
     moved = translate(art, 5.0, -2.0)
     @test moved.paths[1].points == [Point(5.0, -2.0), Point(15.0, -2.0)]
@@ -109,9 +120,9 @@ end
 @testset "hit_shape" begin
     box = ArtObject("box", [PolyLine([Point(10.0, 10.0), Point(50.0, 10.0),
                                       Point(50.0, 50.0), Point(10.0, 50.0)],
-                                     true)], (0, 0, 0))
+                                     true)], 0)
     tri = ArtObject("tri", [PolyLine([Point(200.0, 200.0), Point(240.0, 200.0),
-                                      Point(220.0, 240.0)], true)], (0, 0, 0))
+                                      Point(220.0, 240.0)], true)], 0)
     m = matrix(Camera((0.0, 0.0), 0.0, 2.0))
     # 2 px/mm: world (220, 200) is canvas (440, -400)
     @test hit_shape(m, [box, tri], 440.0, -400.0, 4.0) == 2
@@ -163,7 +174,7 @@ end
     @testset "fit_camera: small content keeps the work area visible" begin
         pl = PolyLine([Point(0.0, 0.0), Point(100.0, 0.0), Point(100.0, 50.0),
                        Point(0.0, 50.0)], true)
-        art = ArtObject("box", [pl], layer_color(0))
+        art = ArtObject("box", [pl], 0)
         cam = fit_camera(720, 500, [art])
         # The union of the bed and the 100×50 box is the bed itself.
         @test cam.scale ≈ (500 - 48) / 300
@@ -177,7 +188,7 @@ end
     @testset "fit_camera: oversized content zooms out past the work area" begin
         pl = PolyLine([Point(0.0, 0.0), Point(600.0, 0.0), Point(600.0, 50.0),
                        Point(0.0, 50.0)], true)
-        art = ArtObject("wide", [pl], layer_color(0))
+        art = ArtObject("wide", [pl], 0)
         cam = fit_camera(720, 500, [art])
         # The union of the bed (300×300) and the 600 mm wide box is
         # 600×300 mm, width-limited.
@@ -197,7 +208,7 @@ using Rocks: Observable
 @testset "position toolbar" begin
     pl = PolyLine([Point(10.0, 10.0), Point(60.0, 10.0), Point(60.0, 40.0),
                    Point(10.0, 40.0)], true)
-    art = ArtObject("box", [pl], layer_color(0))
+    art = ArtObject("box", [pl], 0)
 
     "Collect the pressable fibers of the subtree rooted at `f`."
     function pressables(f, out = Rocks.Fiber[])
@@ -249,6 +260,77 @@ using Rocks: Observable
             @test length(fields) == 4
             # No grayed out arrows with a live selection.
             @test !any(p -> get(p.props, :disabled, false), ps)
+        end
+    end
+end
+
+@testset "layers & layer bar" begin
+    pl = PolyLine([Point(0.0, 0.0), Point(40.0, 0.0), Point(40.0, 20.0),
+                   Point(0.0, 20.0)], true)
+
+    @testset "palette" begin
+        # 30 cut layers + the two tool layers, exact palette colours.
+        @test layer_label(0) == "00" && layer_label(29) == "29"
+        @test layer_label(30) == "T1" && layer_label(31) == "T2"
+        @test is_tool_layer(30) && is_tool_layer(31)
+        @test !is_tool_layer(0)
+        # Layer `04` is rgb(208,208,0) — the analysis table's exact value.
+        @test all(layer_color(4) .≈ (208 / 255, 208 / 255, 0.0))
+        @test all(haskey(LAYER_COLORS_HEX, l) for l in 0:(CUT_LAYERS + 1))
+    end
+
+    @testset "set_layer" begin
+        arts = [ArtObject("a", [pl], 0), ArtObject("b", [pl], 2)]
+        assigned = set_layer(arts, 5)
+        @test all(a -> a.layer == 5, assigned)
+        @test [a.layer for a in arts] == [0, 2]   # the source list untouched
+        # Geometry is shared, not copied: an alias of the paths.
+        @test assigned[1].paths === arts[1].paths
+    end
+
+    @testset "layer bar: click behaviour" begin
+        doc = Observable([ArtObject("a", [pl], 0)])
+        selection = Observable{Union{Nothing,Int}}(nothing)
+        active = Observable(0)
+        app = () -> (Rocks.@rock LayerBar(doc = doc, selection = selection,
+                                          active_layer = active))
+        Rocks.RUNNING[] = true
+        Rocks.DIRTY[] = true
+        Rocks.init_backend()
+        tree = Rocks.create_root(app, (;))
+        Rocks.perform_render!(tree)
+        Rocks.run_effects!()
+        Rocks.flush_dirty!()
+        try
+            # The chips, in palette order: 16×16 pressables with handlers.
+            chip_pressables(f, out = Rocks.Fiber[]) = begin
+                f.kind === Rocks.Pressable && push!(out, f)
+                foreach(c -> chip_pressables(c, out), f.children)
+                out
+            end
+            chips = [f for f in chip_pressables(tree)
+                     if get(f.props, :width, 0) == 16 &&
+                        get(f.props, :height, 0) == 16]
+            @test length(chips) == CUT_LAYERS + 2
+            # Nothing selected: the click only sets the colour for newly
+            # created shapes; the document is untouched.
+            chips[6].props[:on_press]()     # layer `05`
+            @test active[] == 5
+            @test doc[][1].layer == 0
+            # With a selection: the objects are recoloured — and the click
+            # also updates the active colour.
+            selection[] = 1
+            Rocks.flush_dirty!(); Rocks.run_effects!()
+            chips[3].props[:on_press]()     # layer `02` on the selection
+            @test doc[][1].layer == 2
+            @test active[] == 2
+            # Syncs back into the spinner-free toolbar: the chip's border
+            # highlight flips with `active`.
+            Rocks.flush_dirty!(); Rocks.run_effects!()
+        finally
+            Rocks.RUNNING[] = false
+            Rocks.unmount!(tree)
+            Rocks.shutdown_backend()
         end
     end
 end

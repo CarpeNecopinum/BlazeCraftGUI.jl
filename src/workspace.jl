@@ -273,7 +273,8 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase)
                                      phase = dash_phase + mod(path_index * 2.399963, 10.0),
                                      closed = pl.closed)
             else
-                ctx.polyline(pts; color = obj.color, width = 1, closed = pl.closed)
+                ctx.polyline(pts; color = layer_color(obj.layer), width = 1,
+                             closed = pl.closed)
             end
         end
     end
