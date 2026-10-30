@@ -299,8 +299,8 @@ end
 
 Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm grid
 with thicker 100 mm majors, the document's outlines (one stroke color per
-layer) — and, when a shape is selected, its marching-dash outline, a dashed
-bounding box and the transform handles.
+layer) — and, for every selected shape, its marching-dash outline and a
+dashed bounding box; a single selection also gets the transform handles.
 
 `processes` carries the per-layer process assignment: layers whose mode is
 `fill` or `offset_fill` render their closed geometry as an **even-odd**
@@ -346,7 +346,7 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
     draw_layer_fills!(ctx, m, doc, processes, fill_cache)
 
     for (idx, obj) in enumerate(doc)
-        selected = selection !== nothing && idx == selection
+        selected = idx in selection
         for (path_index, pl) in enumerate(obj.paths)
             length(pl.points) < 2 && continue
             pts = [apply(m, p) for p in pl.points]
@@ -377,28 +377,36 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                              dash = 5.0, gap = 3.0, closed = true)
     end
 
-    # The selection decoration: dashed bounding box, transform handles.
-    if selection !== nothing
-        bbox = selection_bbox(m, doc, selection)
-        if bbox !== nothing
-            handles = selection_handles(bbox)
+    # The selection decoration: a marching-dash outline and dashed bounding
+    # box per selected shape; a single selection also gets the transform
+    # handles.
+    if !isempty(selection)
+        for idx in selection
+            bbox = selection_bbox(m, doc, idx)
+            bbox === nothing && continue
             (x0, y0, x1, y1) = bbox
             draw_dashed_polyline(ctx, [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
                                  color = (0.15, 0.35, 0.9), width = 1.0,
                                  dash = 4.0, gap = 3.0, phase = dash_phase)
-            # Thin lines from the corners out to the rotation handles.
-            for (corner, rot) in zip(handles.corners, handles.rotate)
-                ctx.line(corner[1], corner[2], rot[1], rot[2];
-                         color = (0.15, 0.35, 0.9), width = 1.0)
+        end
+        if length(selection) == 1
+            bbox = selection_bbox(m, doc, selection[1])
+            if bbox !== nothing
+                handles = selection_handles(bbox)
+                # Thin lines from the corners out to the rotation handles.
+                for (corner, rot) in zip(handles.corners, handles.rotate)
+                    ctx.line(corner[1], corner[2], rot[1], rot[2];
+                             color = (0.15, 0.35, 0.9), width = 1.0)
+                end
+                for (hx, hy) in handles.rotate
+                    draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
+                end
+                for (hx, hy) in handles.corners
+                    draw_handle(ctx, hx, hy)
+                end
+                (hx, hy) = handles.center
+                draw_handle(ctx, hx, hy; fill = (0.15, 0.35, 0.9))
             end
-            for (hx, hy) in handles.rotate
-                draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
-            end
-            for (hx, hy) in handles.corners
-                draw_handle(ctx, hx, hy)
-            end
-            (hx, hy) = handles.center
-            draw_handle(ctx, hx, hy; fill = (0.15, 0.35, 0.9))
         end
     end
     return nothing
@@ -445,7 +453,7 @@ the client area, because the scroll content never gives `flex` extra space
 to grow into.
 """
 function Workspace(; doc = Observable(ArtObject[]),
-                   selection = Observable{Union{Nothing,Int}}(nothing),
+                   selection = Observable(Int[]),
                    processes = Observable(Dict{Int,Process}()),
                    tool = Observable(:mouse),
                    active_layer = Observable(0), props...)
@@ -545,23 +553,39 @@ function Workspace(; doc = Observable(ArtObject[]),
                 return nothing
             end
             sel = selection_obs[]
-            # 1. Transform handles of the current selection.
-            if sel !== nothing
-                bbox = selection_bbox(matrix(view[]), doc_obs[], sel)
+            # 1. Transform handles of a single selection (multi-selection
+            # draws dashes only; per-shape transform comes later).
+            if length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])
+                bbox = selection_bbox(matrix(view[]), doc_obs[], sel[1])
                 if bbox !== nothing
                     handle = handle_at(selection_handles(bbox), x, y)
                     if handle !== nothing
                         drag_mode[] = handle
-                        drag_art[] = doc_obs[][sel]
+                        drag_art[] = doc_obs[][sel[1]]
                         drag_bbox[] = bbox
                         drag_start[] = (x, y)
                         return nothing
                     end
                 end
             end
-            # 2. Select a shape by clicking one of its lines; empty space deselects.
-            selection_obs[] = hit_shape(matrix(view[]), doc_obs[], x, y,
-                                        8.0 / view[].scale)
+            # 2. Click a shape: Shift adds it to (or removes it from) the
+            # multi-selection; a plain click selects just it; empty space
+            # clears the selection.
+            idx = hit_shape(matrix(view[]), doc_obs[], x, y,
+                            8.0 / view[].scale)
+            if idx === nothing
+                selection_obs[] = Int[]
+            elseif Rocks.LAST_KEYMODS[] & 0x0003 != 0      # either Shift held
+                s = copy(sel)
+                if idx in s
+                    deleteat!(s, findfirst(==(idx), s))
+                else
+                    push!(s, idx)
+                end
+                selection_obs[] = sort!(s)
+            else
+                selection_obs[] = [idx]
+            end
             return nothing
         end,
         # `on_move` also fires on plain hover; the drag mode gates the work.
@@ -579,7 +603,8 @@ function Workspace(; doc = Observable(ArtObject[]),
                 return nothing
             end
             sel = selection_obs[]
-            sel === nothing && return nothing
+            length(sel) != 1 && return nothing
+            sel = sel[1]
             inv_m = inv(matrix(view[]))
             if mode == :translate
                 sw = inv_m * SVector(drag_start[][1], drag_start[][2], 1.0)
@@ -632,7 +657,7 @@ function Workspace(; doc = Observable(ArtObject[]),
                     doc_obs[] = vcat(doc_obs[], [rect_art(
                         "rectangle", Float64(sx), Float64(sy),
                         Float64(ex), Float64(ey), active_obs[])])
-                    selection_obs[] = length(doc_obs[])
+                    selection_obs[] = [length(doc_obs[])]
                 end
                 rect_drag[] = nothing
             end

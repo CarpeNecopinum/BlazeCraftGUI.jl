@@ -48,37 +48,48 @@ end
 # layers. Clicking a swatch assigns its layer to the selected objects — with
 # nothing selected it becomes the colour for newly created shapes.
 function LayerBar(; doc = Observable(ArtObject[]),
-                  selection = Observable{Union{Nothing,Int}}(nothing),
+                  selection = Observable(Int[]),
                   active_layer = Observable(0), fill = false)    doc_obs = @use doc
     selection_obs = @use selection
     active_obs = @use active_layer
     t = E.theme()
 
-    "Recolour the selection to layer `l` and make it the colour for newly
-    created shapes (LightBurn's palette click behaviour)."
+    "Recolour all selected shapes to layer `l` and make it the colour for
+    newly created shapes (LightBurn's palette click behaviour)."
     set_layer!(l) = begin
         sel = selection_obs[]
-        if sel !== nothing && 1 <= sel <= length(doc_obs[])
+        if !isempty(sel)
             d = copy(doc_obs[])
-            d[sel] = first(set_layer([doc_obs[][sel]], l))
+            for i in sel
+                1 <= i <= length(d) || continue
+                d[i] = first(set_layer([d[i]], l))
+            end
             doc_obs[] = d
         end
         active_obs[] = l
         return nothing
     end
 
+    # The layers of the selected shapes — every one of them lights its chip
+    # (a multi-selection spanning layers lights them all).
+    selected_layers() = Set(doc_obs[][i].layer for i in selection_obs[]
+                            if 1 <= i <= length(doc_obs[]))
+
     # A palette chip: the layer colour as a raised square; the active one
-    # (colour for new shapes) carries the selection-colour border. Tool
-    # layers get a tiny T1/T2 caption since they act differently.
-    chip(l) = Mechanics.Button(;
-        label = is_tool_layer(l) ? layer_label(l) : "",
-        on_press = () -> set_layer!(l),
-        width = 16, height = 16, padding = 0, gap = 0, radius = 4,
-        background = layer_color(l),
-        text_color = (0.05, 0.05, 0.05), size = 6, font = t.font,
-        border_color = active_obs[] == l ? t.colors.selection :
-                                           t.colors.border,
-        border_width = active_obs[] == l ? 2 : 1, bevel = :raised)
+    # (colour for new shapes) and every layer holding selected shapes carry
+    # the selection-colour border. Tool layers get a tiny T1/T2 caption
+    # since they act differently.
+    chip(l) = begin
+        lit = active_obs[] == l || l in selected_layers()
+        Mechanics.Button(;
+            label = is_tool_layer(l) ? layer_label(l) : "",
+            on_press = () -> set_layer!(l),
+            width = 16, height = 16, padding = 0, gap = 0, radius = 4,
+            background = layer_color(l),
+            text_color = (0.05, 0.05, 0.05), size = 6, font = t.font,
+            border_color = lit ? t.colors.selection : t.colors.border,
+            border_width = lit ? 2 : 1, bevel = :raised)
+    end
 
     chips = Any[chip(l) for l in 0:(CUT_LAYERS + 1)]
     return E.StatusBar(grip = false, fill = fill, panels = chips)
@@ -145,11 +156,14 @@ function ToolsPanel(; tool = Observable(:mouse), width = 44, fill = false)
     t = E.theme()
     function tool_button(icon_name, mode)
         active = tool_obs[] === mode
+        glyph = MDI_GLYPHS[icon_name]
         @rock Pressable(
-            (@rock E.Icon(icon_name; size = 15, color = t.colors.text));
+            @rock Font(font = MDI_FONT, size = 20, weight = "medium",
+                       variant = "normal";
+                       @rock E.Icon(name = glyph; size = 20, color = t.colors.text));
             on_press = () -> (tool_obs[] = mode),
-            width = "100%", height = 36,
-            direction = :column, align = :center,
+            width = "100%", height = 32,
+            direction = :column, align = :center, justify = :center,
             background = active ? t.gradients.item_hot : nothing,
             hover_background = active ? t.gradients.item_hot :
                                        t.gradients.button_hover,
@@ -309,7 +323,7 @@ function origin_grid(origin::Observable)
 end
 
 function PositionToolbar(; doc = Observable(ArtObject[]),
-                         selection = Observable{Union{Nothing,Int}}(nothing),
+                         selection = Observable(Int[]),
                          origin = Observable((2, 2)),
                          lock = Observable(false),
                          fill = false)
@@ -338,8 +352,8 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     # Keep the spinners in sync when the selection or the document changes.
     useEffect(() -> begin
         sel = selection_obs[]
-        if sel !== nothing && 1 <= sel <= length(doc_obs[])
-            bounds = document_bounds([doc_obs[][sel]])
+        if length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])
+            bounds = document_bounds([doc_obs[][sel[1]]])
             if bounds !== nothing
                 (ax, ay) = anchor_point(bounds)
                 x_pos[] = ax
@@ -354,15 +368,15 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     "Move the selection so its anchor point lands on `(v, other)`."
     function move_to!(v, axis)
         sel = selection_obs[]
-        (sel !== nothing && 1 <= sel <= length(doc_obs[])) || return
-        art = doc_obs[][sel]
+        (length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])) || return
+        art = doc_obs[][sel[1]]
         bounds = document_bounds([art])
         bounds === nothing && return
         (ax, ay) = anchor_point(bounds)
         dx = axis == :x ? v - ax : 0.0
         dy = axis == :y ? v - ay : 0.0
         d = copy(doc_obs[])
-        d[sel] = translate(art, dx, dy)
+        d[sel[1]] = translate(art, dx, dy)
         doc_obs[] = d
         return nothing
     end
@@ -371,8 +385,8 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     the 9-dot anchor; the lock makes scaling uniform."
     function resize_to!(v, axis)
         sel = selection_obs[]
-        (sel !== nothing && 1 <= sel <= length(doc_obs[])) || return
-        art = doc_obs[][sel]
+        (length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])) || return
+        art = doc_obs[][sel[1]]
         bounds = document_bounds([art])
         bounds === nothing && return
         anchor = anchor_point(bounds)
@@ -384,7 +398,7 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
             axis == :w ? (sy = sx) : (sx = sy)
         end
         d = copy(doc_obs[])
-        d[sel] = scale(art, sx, sy, anchor)
+        d[sel[1]] = scale(art, sx, sy, anchor)
         doc_obs[] = d
         return nothing
     end
@@ -392,23 +406,28 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     # The 3×3 origin grid.
     grid = origin_grid(origin_obs)
 
-    # The lock button: highlighted while the aspect ratio is locked.
-    lock_btn = Mechanics.Button(; label = "Lock",
-                                on_press = () -> lock_obs[] = !lock_obs[],
-                                width = 46, height = t.metrics.input_height,
-                                padding = 4, gap = 0, radius = 0,
-                                background = lock_obs[] ? t.colors.selection :
-                                               t.colors.control,
-                                text_color = t.colors.text,
-                                border_color = t.colors.border, border_width = 1,
-                                size = t.metrics.font_size - 2, font = t.font,
-                                bevel = :raised)
+    # The lock button: a closed padlock while the aspect ratio is locked,
+    # an open one when it is not; highlighted while locked.
+    locked = lock_obs[]
+    glyph = locked ? MDI_GLYPHS["lock"] : MDI_GLYPHS["lock-open"]
+    lock_btn = (@rock Mechanics.Button(
+        @rock Font(font = MDI_FONT, size = 16, weight = "medium",
+                   variant = "normal";
+                   @rock E.Icon(name = glyph; size = 16, color = t.colors.text));
+        on_press = () -> (lock_obs[] = !lock_obs[]),
+        width = t.metrics.input_height, height = t.metrics.input_height,
+        padding = 2, gap = 0, radius = 0,
+        background = locked ? t.colors.selection : t.colors.control,
+        text_color = t.colors.text,
+        border_color = t.colors.border, border_width = 1,
+        size = t.metrics.font_size - 2, font = t.font, bevel = :raised))
     axis_label(text) = @rock Box(@rock E.Label(text);
                                  width = 16, align = :center, direction = :row)
-    # The translate/scale inputs only act on a selection; with none they are
-    # grayed out. (The toolbar re-renders on selection changes.)
-    has_sel = selection_obs[] !== nothing &&
-              1 <= selection_obs[] <= length(doc_obs[])
+    # The translate/scale inputs only act on a single selection; with none
+    # (or a multi-selection) they are grayed out. (The toolbar re-renders on
+    # selection changes.)
+    has_sel = length(selection_obs[]) == 1 &&
+              1 <= selection_obs[][1] <= length(doc_obs[])
     # A labelled spinner: the label to its left; edits apply to the selection.
     spinner_row(label, obs, apply, step = 1.0) = @rock Row(
         axis_label(label),
@@ -441,7 +460,7 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     # (tests embed their own); then the internal ones are unused.
     doc_internal = @use Observable(ArtObject[])
     doc = doc === nothing ? doc_internal : doc
-    selection_internal = @use Observable{Union{Nothing,Int}}(nothing)
+    selection_internal = @use Observable(Int[])
     selection = selection === nothing ? selection_internal : selection
     origin_internal = @use Observable((2, 2))
     origin = origin === nothing ? origin_internal : origin
@@ -510,6 +529,22 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
         title = "BlazeCraft",
         width = SHELL_WIDTH, height = SHELL_HEIGHT, padding = 0,
         menu = menu,
+        # Keyboard shortcuts (no field focused): Delete removes the selected
+        # shapes, Escape resets the tool to the mouse.
+        on_key = (key) -> begin
+            if key == "Delete"
+                idxs = filter(i -> 1 <= i <= length(doc[]), selection[])
+                if !isempty(idxs)
+                    d = copy(doc[])
+                    deleteat!(d, idxs)
+                    doc[] = d
+                    selection[] = Int[]
+                end
+            elseif key == "Escape"
+                tool[] = :mouse
+            end
+            return nothing
+        end,
         toolbar = (@rock PositionToolbar(doc = doc, selection = selection,
                                          origin = origin, lock = lock)),
         status = (@rock Row(DocStatus(doc = doc), (@rock Box(; flex = 1)),

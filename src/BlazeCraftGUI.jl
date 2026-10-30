@@ -2,6 +2,7 @@ module BlazeCraftGUI
 
 import Rocks
 import Rocks: Enterprise as E
+import Rocks.Enterprise: Font
 using Rocks
 # PolyLine, Point and flatten come from BlazeCraft.Shapes; the app-level
 # `Observable` is Rocks' re-export of Observables.
@@ -14,6 +15,7 @@ include("camera.jl")
 include("cuts.jl")
 include("fills.jl")
 include("filedialog.jl")
+include("icons.jl")
 include("workspace.jl")
 include("app.jl")
 

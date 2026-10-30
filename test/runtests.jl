@@ -281,7 +281,7 @@ using Rocks: Observable
     end
 
     @testset "nothing selected: inputs disabled" begin
-        with_toolbar(Observable{Union{Nothing,Int}}(nothing)) do tree
+        with_toolbar(Observable(Int[])) do tree
             ps = pressables(tree)
             # The spinner fields drop their keyboard-handler props, so no
             # pressable handles text input.
@@ -295,7 +295,7 @@ using Rocks: Observable
     end
 
     @testset "selection present: inputs enabled and synced" begin
-        with_toolbar(Observable{Union{Nothing,Int}}(1)) do tree
+        with_toolbar(Observable([1])) do tree
             ps = pressables(tree)
             fields = filter(p -> haskey(p.props, :on_text_input), ps)
             @test length(fields) == 4
@@ -331,7 +331,7 @@ end
 
     @testset "layer bar: click behaviour" begin
         doc = Observable([ArtObject("a", [pl], 0)])
-        selection = Observable{Union{Nothing,Int}}(nothing)
+        selection = Observable(Int[])
         active = Observable(0)
         app = () -> (Rocks.@rock LayerBar(doc = doc, selection = selection,
                                           active_layer = active))
@@ -360,11 +360,20 @@ end
             @test doc[][1].layer == 0
             # With a selection: the objects are recoloured — and the click
             # also updates the active colour.
-            selection[] = 1
+            selection[] = [1]
             Rocks.flush_dirty!(); Rocks.run_effects!()
             chips[3].props[:on_press]()     # layer `02` on the selection
             @test doc[][1].layer == 2
             @test active[] == 2
+            # Multi-select: every layer holding selected shapes lights its
+            # chip (the selection border); the others stay dim.
+            doc[] = [ArtObject("a", [pl], 0), ArtObject("b", [pl], 2)]
+            selection[] = [1, 2]
+            Rocks.flush_dirty!(); Rocks.run_effects!()
+            sel_color = Rocks.Enterprise.light_theme().colors.selection
+            lit = [c for c in chips
+                   if get(c.props, :border_color, nothing) == sel_color]
+            @test length(lit) == 2
             # Syncs back into the spinner-free toolbar: the chip's border
             # highlight flips with `active`.
             Rocks.flush_dirty!(); Rocks.run_effects!()
@@ -560,7 +569,7 @@ end
     # must not join the flow (it used to squish the workspace).
     import SDL3
     doc = Observable(ArtObject[])
-    selection = Observable{Union{Nothing,Int}}(nothing)
+    selection = Observable(Int[])
     processes = Observable(Dict{Int,Process}())
     tool = Observable(:mouse)
     active_layer = Observable(0)
@@ -573,11 +582,14 @@ end
         main = windows[1]
         Rocks.draw_window!(main)             # the first draw applies the view fit
 
-        # 1. Pick the rectangle tool: the strip button with the ▭ glyph.
-        rect_btn = Rocks.find_fiber(main) do f
+        # 1. Pick the rectangle tool: the strip button carrying the
+        # `rectangle` MDI glyph (tests address it by the glyph char via the
+        # `icon` prop that `Icon` carries).
+        tool_button(glyph) = Rocks.find_fiber(main) do f
             f.kind === Rocks.Pressable &&
-                Rocks.find_by_label(f, "▭") !== nothing
+                any(k -> get(k.props, :icon, nothing) == glyph, Rocks.fibers(f))
         end
+        rect_btn = tool_button(BlazeCraftGUI.MDI_GLYPHS["rectangle"])
         @test rect_btn !== nothing
         Rocks.click!(rect_btn)
         Rocks.drain_events!()
@@ -606,7 +618,7 @@ end
         @test length(doc[]) == 1
         @test doc[][1].name == "rectangle"
         @test doc[][1].layer == 0
-        @test selection[] == 1
+        @test selection[] == [1]
         # The created rectangle spans the dragged corners (world mm, y-up);
         # the drag lands on pixel centres, so allow the rounding slack.
         bounds = document_bounds(doc[])
@@ -615,10 +627,96 @@ end
         @test isapprox(bounds[2][1], 200.0; atol = 0.5)
         @test isapprox(bounds[2][2], 160.0; atol = 0.5)
 
-        # 3. The process row shows up on layer 00; double-pressing it opens
-        # the editor as its own window. The doc change re-laid-out the
-        # panel — sync first, or the fresh row has no placed rect and the
-        # click would land at the window origin (the menu bar).
+        # 3. Multi-select: a second rectangle on layer 02 (the active
+        # colour), then switch to the select tool and Shift+click the first —
+        # the selection spans both layers and both layer chips light up.
+        active_layer[] = 2
+        a2, b2 = pt(SVector(40.0, 190.0)), pt(SVector(140.0, 240.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, a2...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_MOTION, b2...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b2...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 2
+        @test doc[][2].layer == 2
+        @test selection[] == [2]
+
+        select_btn = tool_button(BlazeCraftGUI.MDI_GLYPHS["select"])
+        @test select_btn !== nothing
+        Rocks.click!(select_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :mouse
+        # Shift+click on the first rectangle's top edge adds it.
+        Rocks.LAST_KEYMODS[] = 0x0001            # Shift held
+        c1 = pt(SVector(150.0, 100.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, c1...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, c1...)
+        Rocks.drain_events!()
+        Rocks.LAST_KEYMODS[] = 0x0000
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [1, 2]
+        # Every layer holding selected shapes lights its chip; exactly two
+        # of the 32 palette chips are lit.
+        sel_color = Rocks.Enterprise.light_theme().colors.selection
+        lit = [f for f in Rocks.fibers(main)
+               if f.kind === Rocks.Pressable && get(f.props, :width, 0) == 16 &&
+                  get(f.props, :height, 0) == 16 &&
+                  get(f.props, :border_color, nothing) == sel_color]
+        @test length(lit) == 2
+
+        # 4. Escape resets the tool to the mouse; Delete removes every
+        # selected shape.
+        Rocks.click!(rect_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :rect
+        Rocks.push_key!(main, SDL3.SDLK_ESCAPE)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :mouse
+        Rocks.push_key!(main, SDL3.SDLK_DELETE)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test isempty(doc[])
+        @test isempty(selection[])
+
+        # 5. Draw again (the view refits on the now-empty document) and open
+        # the editor: the process row shows up on layer 00; double-pressing
+        # it opens the editor as its own window. The doc change re-laid-out
+        # the panel — sync first, or the fresh row has no placed rect and
+        # the click would land at the window origin (the menu bar).
+        active_layer[] = 0
+        Rocks.click!(rect_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :rect
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing,
+                                 windows)]
+        Rocks.draw_window!(main)                 # applies the refit
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        a, b = pt(SVector(100.0, 100.0)), pt(SVector(200.0, 160.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, a...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_MOTION, b...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 1
         split = Rocks.find_kind(main, Rocks.Split)
         @test split !== nothing
         split_h = split.rect[4]

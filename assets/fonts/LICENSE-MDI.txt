@@ -1,0 +1,9 @@
+Material Design Icons font (materialdesignicons-webfont.ttf)
+Version 7.4.47, from https://materialdesignicons.com /
+https://github.com/Templarian/MaterialDesign-Webfont
+
+Licensed under the Pictogrammers Free License (SIL Open Font License based):
+https://github.com/Pictogrammers/Pictogrammers-Free-License
+
+The font is bundled unmodified; icon name -> codepoint mappings live in
+Rocks' Enterprise theme (src/Enterprise/common.jl).

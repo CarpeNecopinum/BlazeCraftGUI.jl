@@ -1097,3 +1097,74 @@ assert the editor opened and the split kept its height).
 40. **Drag-created geometry lands on pixel centres** — the tool unprojects rounded canvas pixels, so a
     dragged rectangle is off by up to 0.5 px / zoom (≈ 0.27 mm at the default fit). Tests assert with
     `atol ≈ 0.5`; a "snap to grid" option can come later.
+
+### 8.13 MDI icons, selection keys, and multi-select (2026-10-26)
+
+**Icons: a `Font` component, not a global font** (2026-10-28): the Enterprise design stays
+font-agnostic — its built-in `ICONS` are unicode approximations. Rocks gained the generic
+**`Enterprise.Font(; font, weight, variant, size, children...)`** component: it walks its element
+children and applies `font` (a TTF/OTF path) and `size` (px) to every `Text` in the subtree, recursing
+through host containers, and passes them to **component** elements only when the component declares
+them as keywords (`kwprops` reads `Base.kwarg_decl` — undeclared keywords would fail the component
+call). `weight`/`variant` describe the face and ride along as `font_weight`/`font_variant` props
+(SDL_ttf renders one face per file, so the app picks the file for the weight it wants). An
+icon-bearing button is a button containing a `Font` that contains the icon:
+
+```julia
+@rock Pressable(
+    @rock Font(font = MDI_FONT, size = 20, weight = "medium";
+               @rock E.Icon(name = glyph; size = 20, color = t.colors.text));
+    on_press = ...)
+```
+
+`Icon` no longer resolves a global icon font: it renders `name` (a semantic unicode glyph from
+`ICONS`, or a glyph char such as an MDI codepoint) and carries the name as an `icon` prop for
+tests/probes (`get(f.props, :icon, nothing)`). BlazeCraftGUI owns the taste: `src/icons.jl` bundles
+the MDI 7.x webfont (`assets/fonts/`, Pictogrammers Free License — `LICENSE-MDI.txt`) plus the
+`MDI_GLYPHS` name → codepoint map and the `MDI_FONT` path; use sites wrap icons in `Font(font =
+MDI_FONT, ...)`. Codepoints were extracted from the MDI css with `grep -A2 "\.mdi-<name>::before"`.
+
+**Tool strip and lock button**: tool buttons are 32px tall with 20px glyphs, `justify = :center` +
+`align = :center` (bigger icon, smaller button, properly centred). The position toolbar's lock button
+is a square `input_height` button whose icon shows the actual state: **`lock`** (closed padlock,
+selection-blue background) while scaling is uniform, **`lock-open`** (open shackle) when not.
+
+**Selection is a vector** (`Observable{Vector{Int}}`, sorted): a plain click selects one shape,
+**Shift+click** (either Shift — `LAST_KEYMODS[] & 0x0003`) toggles a shape in/out of the
+multi-selection, empty space clears. Every selected shape draws its marching-dash outline and dashed
+bbox; **transform handles only appear for a single selection** (per-shape transform for multi comes
+later). Consumers updated: PositionToolbar (spinners sync/act on a single selection only, disabled
+otherwise), LayerBar (`set_layer!` recolours *all* selected shapes), and the rect tool's commit path
+(selects the new shape).
+
+**Layer chips light up**: a chip carries the selection-colour border when it is the active colour *or*
+its layer holds any selected shape — a multi-selection spanning layers lights them all.
+
+**Keyboard shortcuts** (App `on_key` via the new `Form(on_key = …)` forwarding — keys reach the window
+when no field holds focus): **Delete** removes every selected shape (`deleteat!` on a sorted copy,
+selection cleared), **Escape** resets the tool to the mouse. Escape still dismisses open popup menus
+first (Rocks consumes it before fields see it).
+
+**Gotchas**:
+
+41. **`Icon` text content is the glyph, not the name** — with MDI codepoints, `find_by_label` cannot
+    match icon buttons by their old unicode glyph; address them through the `icon` prop instead. The
+    prop holds the glyph char passed as `name`, so compare against `MDI_GLYPHS[name]` (a `Char`), not
+    the semantic string.
+42. **Writes into a typed `Observable{Vector{Int}}` must be vectors everywhere** — the rect commit
+    path still wrote `selection[] = length(doc)` (scalar) and `LAST_KEYMODS` needed the `Rocks.`
+    qualifier from BlazeCraftGUI; the suite caught both via `convert` MethodErrors.
+43. **`(a; b)` is a Julia block, not a children list** — children after `;` only work *inside* an
+    `@rock` call: `@rock Font(props...; @rock Icon(...))`. Writing `@rock Parent((@rock Font(...);
+    @rock Icon(...)))` evaluates the block (returning only the last expression), silently dropping
+    the `Font` element — the icon rendered with no font while the tree looked plausible.
+44. **Positional args of `@rock Component(x; ...)` become children, not a parameter** — `@rock
+    E.Icon(glyph; ...)` stringified the glyph child into `name`, so the `icon` prop was a `String`;
+    pass `name = glyph` when the identity must stay a `Char`.
+45. **`Method.kwargs` is gone in Julia 1.13** — inspect keyword names with `Base.kwarg_decl(m)`
+    (`Symbol[...]`; varargs-keyword methods report `Symbol("kwargs...")`, which must be ignored when
+    deciding what a component really accepts, or a forwarding wrapper like `Icon(name; kwargs...)`
+    makes everything look supported).
+46. **Direct (non-`@rock`) component calls are keyword-only** — `Mechanics.Button(element; props...)`
+    is a `MethodError`; wrap the call in `@rock` (children after `;`) or pass `children =
+    Any[...]` explicitly.
