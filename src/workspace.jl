@@ -165,20 +165,25 @@ end
 """
     shapes_in_rect(doc, rect, mode) -> Vector{Int}
 
-The indices of the shapes a **marquee** rectangle `rect` (two world-mm
-corners) selects, ascending:
+The doc indices the **marquee** rectangle `rect` (two world-mm corners)
+selects, ascending. Selection units are the *top-level* entries (`top_level_indices`
+— ungrouped shapes and outermost groups): a group acts like a single shape,
+so its whole unit joins via its combined bounds (`art_bounds` over all its
+subtree shapes) and a partially covered group falls out entirely either way:
 
-  - `mode = :contained` — only shapes entirely inside the rect (the red
+  - `mode = :contained` — only units entirely inside the rect (the red
     marquee, started at one of its left corners),
-  - `mode = :overlapping` — every shape whose bounding box intersects the
-    rect (the green marquee, started at one of its right corners).
+  - `mode = :overlapping` — every unit whose combined bounding box
+    intersects the rect (the green marquee, started at one of its right
+    corners). The selected indices may be group entries (the group joins
+    whole, then behaves like any other selection).
 """
 function shapes_in_rect(doc, rect, mode)
     (a, b) = rect
     r = (min(a[1], b[1]), min(a[2], b[2]), max(a[1], b[1]), max(a[2], b[2]))
     out = Int[]
-    for (idx, obj) in enumerate(doc)
-        bo = document_bounds([obj])
+    for idx in top_level_indices(doc)
+        bo = art_bounds(doc, idx)
         bo === nothing && continue
         ok = mode === :contained ?
              (bo[1][1] >= r[1] && bo[2][1] <= r[3] &&
@@ -210,8 +215,10 @@ end
     selection_union_bbox(m, doc, selection) -> (x0, y0, x1, y1)
 
 The bounding rectangle (canvas-local pixels, y-down) of *all* selected
-shapes — their world bounds united and projected. The selection frame and
-its handles enclose this union, so with several shapes selected every
+content — selection indices resolve through `resolve_leaves`, so a selected
+group contributes the union of all shapes under it (the group frame encloses
+its subtree like a shapes' frame encloses one shape). The selection frame
+and its handles enclose this union, so with several shapes selected every
 operation applies relative to the combined centre of bounds. The result is
 snapped to **pixel corners** (`square_px`): endpoints sitting on pixel
 centres make SDL's line raster spill into the neighbouring row/column and
@@ -220,8 +227,7 @@ precision — this snapping is render-pixel only, never world geometry).
 """
 function selection_union_bbox(m, doc, selection)
     bounds = nothing
-    for idx in selection
-        1 <= idx <= length(doc) || continue
+    for idx in resolve_leaves(doc, selection)
         b = document_bounds([doc[idx]])
         b === nothing && continue
         bounds = bounds === nothing ? b :
@@ -425,8 +431,11 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
     # on top, and same-layer overlaps erase through the even-odd rule.
     draw_layer_fills!(ctx, m, doc, processes, fill_cache)
 
+    # The selection highlights: selection indices resolve to the leaf shapes
+    # they cover (a selected group's members run the marching dashes).
+    selected_leaves = Set(resolve_leaves(doc, selection))
     for (idx, obj) in enumerate(doc)
-        selected = idx in selection
+        selected = idx in selected_leaves
         for (path_index, pl) in enumerate(obj.paths)
             length(pl.points) < 2 && continue
             pts = [apply(m, p) for p in pl.points]
@@ -540,16 +549,26 @@ end
 
 The interactive workspace. `doc` is an `Observable{Vector{ArtObject}}` owned
 by the app and `selection` an `Observable{Vector{Int}}` (the selected
-shapes' indices). A left click on a shape selects it (Shift adds/removes
-of the multi-selection — the Shift has to be held *while* clicking — empty
-space starts a **marquee**: dragging rightward (from a left corner) draws
-the red containment marquee, dragging leftward (from a right corner) the
-green overlap marquee; a click-shaped drag without movement clears the
-selection); the selection gets a marching-dash outline per shape and one
-frame with transform handles around the *union* of the selection (corner
-squares scale everything relative to the frame's fixed opposite corner, the
-center square translates, the outside rotation handles rotate around the
-combined centre of bounds). The camera moves with a **middle-button drag**
+entries' indices — shapes and/or groups). A left click on a shape selects
+**its group** (the innermost group holding it — "selecting one shape of a
+group selects the whole group"; a top-level shape selects just itself),
+Shift adds/removes of the multi-selection at unit level (the Shift has to
+be held *while* clicking). Empty space starts a **marquee**: dragging
+rightward (from a left corner) draws the red containment marquee, dragging
+leftward (from a right corner) the green overlap marquee — selection units
+are the top-level entries, so a group acts like a single shape either way
+(partially covered group members select nothing); a click-shaped drag
+without movement clears the selection. A **right click** opens the context
+menu (Group / Ungroup) — the menu itself is the app's (`ctx_open` is an
+`Observable{Bool}` prop this component flips; its items act on the
+selection): Group wraps the selected entries into one new group (groups
+into groups nest), Ungroup dissolves every selected group node one level.
+The selection gets a marching-dash outline per shape and one frame with
+transform handles around the *union* of the resolved shapes (corner
+squares scale everything relative to the frame's fixed opposite corner,
+the center square translates, the outside rotation handles rotate around
+the combined centre of bounds). The camera moves with a **middle-button
+drag**
 — the pointer turns into the gripping hand while grabbed, plain hover keeps
 the arrow — and zooms at the wheel cursor; the view refits when a new import
 changes the object count. Layout props (`flex`, `fill`, `height`, …) given
@@ -562,12 +581,14 @@ function Workspace(; doc = Observable(ArtObject[]),
                    selection = Observable(Int[]),
                    processes = Observable(Dict{Int,Process}()),
                    tool = Observable(:mouse),
-                   active_layer = Observable(0), props...)
+                   active_layer = Observable(0),
+                   ctx_open = Observable(false), props...)
     doc_obs = @use doc
     selection_obs = @use selection
     processes_obs = @use processes
     tool_obs = @use tool
     active_obs = @use active_layer
+    ctx_obs = @use ctx_open
 
     # Per-layer fill textures (fills.jl): canvas-local software textures,
     # recreated when their layer's geometry, mode or the camera changes.
@@ -674,7 +695,15 @@ function Workspace(; doc = Observable(ArtObject[]),
                 pan_cam[] = view[]
                 return nothing
             end
-            button == 1 || return nothing      # other buttons: no action yet
+            # Right button: open the context menu (the app's Group/Ungroup
+            # popup) at the click — the menu anchors itself at the pointer
+            # this click just stored. The selection stays as it is; the
+            # menu's items act on it. Not while a drag is running.
+            if button == 3 && drag_mode[] === :none
+                ctx_obs[] = true
+                return nothing
+            end
+            button == 1 || return nothing      # other buttons: no action
             # Rectangle tool: start a creation drag; no selection changes.
             if tool_obs[] === :rect
                 w = inv(matrix(view[])) * SVector(x, y, 1.0)
@@ -693,7 +722,9 @@ function Workspace(; doc = Observable(ArtObject[]),
                 if bbox !== nothing
                     handle = handle_at(selection_handles(bbox), x, y)
                     if handle !== nothing
-                        idxs = filter(i -> 1 <= i <= length(doc_obs[]), sel)
+                        # The frame encloses the selection's resolved
+                        # shapes; the drag transforms exactly those.
+                        idxs = resolve_leaves(doc_obs[], sel)
                         drag_mode[] = handle
                         drag_sel[] = idxs
                         drag_art[] = [doc_obs[][i] for i in idxs]
@@ -719,16 +750,25 @@ function Workspace(; doc = Observable(ArtObject[]),
                 else
                     selection_obs[] = Int[]
                 end
-            elseif Rocks.LAST_KEYMODS[] & 0x0003 != 0      # either Shift held
-                s = copy(sel)
-                if idx in s
-                    deleteat!(s, findfirst(==(idx), s))
-                else
-                    push!(s, idx)
-                end
-                selection_obs[] = sort!(s)
             else
-                selection_obs[] = [idx]
+                # Selecting one shape of a group selects the whole group:
+                # the click unit is the innermost group holding the hit
+                # shape (the shape itself when it is top level). Shift
+                # toggles at the unit level too (the Shift must be held
+                # right now — Rocks refreshes the mods at click time).
+                g = parent_group(doc_obs[], idx)
+                unit = g === nothing ? idx : g
+                if Rocks.LAST_KEYMODS[] & 0x0003 != 0      # either Shift held
+                    s = copy(sel)
+                    if unit in s
+                        deleteat!(s, findfirst(==(unit), s))
+                    else
+                        push!(s, unit)
+                    end
+                    selection_obs[] = sort!(s)
+                else
+                    selection_obs[] = [unit]
+                end
             end
             return nothing
         end,

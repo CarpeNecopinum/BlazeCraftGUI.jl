@@ -51,21 +51,233 @@ function layer_color(n::Int)
             parse(UInt8, hex[6:7]; base = 16) / 255)
 end
 
+# Unique art ids: groups reference their members through ids, not indices,
+# so the hierarchy survives every document edit that shifts indices
+# (imports, deletes). Grouped art keeps its id through geometry edits
+# (translate/scale/… rebuild the entry but preserve `id`).
+const NEXT_ART_ID = Ref(UInt(0))
+art_next_id() = (NEXT_ART_ID[] += UInt(1))
+
 """
     ArtObject(name, paths, layer)
 
-One imported design file (or one source layer of a layered file): its outline
-geometry flattened once into `PolyLine`s (millimetres, y-up), plus the
-LightBurn palette index it belongs to — the palette colour is the shape's
-display colour and its cut attribution (§4: colour = layer).
+One entry of the document (§4: colour = layer): either a **shape** — its
+outline geometry flattened once into `PolyLine`s (millimetres, y-up) — or a
+**group**, a container whose `children` are the ids of its members (shapes
+and/or other groups, i.e. groups nest). Groups hold no geometry and never
+appear on the laser output. `translate`/`scale`/… edits preserve `id`,
+`kind` and `children` through `ArtObject(entry; paths = …)`.
 """
 struct ArtObject
+    id::UInt
+    kind::Symbol                 # :shape or :group
     name::String
     paths::Vector{PolyLine}
     layer::Int
+    children::Vector{UInt}
 end
 
-"Union bounding box (millimetres, y-up) of the document's art; `nothing` for an empty document."
+# The plain constructor every import/creation path uses: a fresh id, a shape.
+ArtObject(name::AbstractString, paths::Vector{PolyLine}, layer::Int) =
+    ArtObject(art_next_id(), :shape, String(name), paths, layer, UInt[])
+
+"Copy of one document entry with selected fields replaced; identity is kept
+(`id`, `kind`, `children`, `name`, `layer` survive unless overridden) so
+group membership over ids is unaffected by edits."
+function ArtObject(art::ArtObject; name::AbstractString = art.name,
+                   paths = art.paths, layer = art.layer,
+                   kind = art.kind, children = art.children)
+    return ArtObject(art.id, Symbol(kind), String(name), paths, Int(layer),
+                     collect(UInt, children))
+end
+
+"""
+    is_group(art) -> Bool
+
+True when the document entry is a group container (its members are other
+entries' ids); a shape has real outline geometry.
+"""
+is_group(art::ArtObject) = art.kind === :group
+
+"""
+    art_index(doc, id) -> Union{Int,Nothing}
+
+The document index of the entry holding id `id`, or `nothing`. Group links
+are ids precisely so this lookup is the only thing an edit needs.
+"""
+function art_index(doc::AbstractVector{ArtObject}, id::UInt)
+    for (i, a) in enumerate(doc)
+        a.id == id && return i
+    end
+    return nothing
+end
+
+"""
+    child_indices(doc, art) -> Vector{Int}
+
+The doc indices of `art`'s member ids, ascending (dangling ids dropped).
+"""
+function child_indices(doc::AbstractVector{ArtObject}, art::ArtObject)
+    return [i for (i, a) in enumerate(doc) if a.id in art.children]
+end
+
+"""
+    leaves_of(doc, idx) -> Vector{Int}
+
+The shape indices under entry `idx`'s subtree, ascending doc order (deeper
+groups recurse; a shape yields itself). A group's outlines *are* its
+leaves' outlines — fitting, transforms, fills all act on the leaf shapes.
+"""
+function leaves_of(doc::AbstractVector{ArtObject}, idx::Int)
+    (1 <= idx <= length(doc)) || return Int[]
+    is_group(doc[idx]) || return [idx]
+    out = Int[]
+    for c in child_indices(doc, doc[idx])
+        append!(out, leaves_of(doc, c))
+    end
+    return out
+end
+
+"""
+    resolve_leaves(doc, selection) -> Vector{Int}
+
+Selection indices resolved to the shape entries they cover: a group index
+expands into its whole subtree, a shape index passes through. Ascending
+doc order, deduped — this is the "what geometry does my selection own"
+helper every consumer (frame, transforms, recolour) goes through.
+"""
+function resolve_leaves(doc::AbstractVector{ArtObject}, selection::AbstractVector{Int})
+    out = Int[]
+    for i in selection
+        append!(out, leaves_of(doc, i))
+    end
+    return sort!(unique!(out))
+end
+
+"""
+    parent_group(doc, idx) -> Union{Int,Nothing}
+
+The index of the *innermost* group holding entry `idx` directly (its id in
+the group's children), or `nothing` for a top-level entry. Clicking a shape
+selects this group per "selecting one shape selects the whole group".
+"""
+function parent_group(doc::AbstractVector{ArtObject}, idx::Int)
+    (1 <= idx <= length(doc)) || return nothing
+    gid = doc[idx].id
+    for (i, a) in enumerate(doc)
+        is_group(a) && gid in a.children && return i
+    end
+    return nothing
+end
+
+"""
+    top_level_indices(doc) -> Vector{Int}
+
+Indices no group holds — ungrouped shapes and *outermost* groups. The
+marquee's selection units: "a group acts like a single shape" means the
+top-level entries are compared against the selection rect as units.
+"""
+function top_level_indices(doc::AbstractVector{ArtObject})
+    members = Set{UInt}()
+    for a in doc
+        is_group(a) && union!(members, a.children)
+    end
+    return [i for (i, a) in enumerate(doc) if !(a.id in members)]
+end
+
+"""
+    art_bounds(doc, idx) -> (pmin, pmax)
+
+World bounding box (millimetres, y-up) of one document entry: its own
+geometry for a shape, the union over all shapes under it for a group (the
+group bbox is what makes a group act like a single shape for marquee and
+groups-as-shapes selection), `nothing` for empty geometry.
+"""
+function art_bounds(doc::AbstractVector{ArtObject}, idx::Int)
+    (1 <= idx <= length(doc)) || return nothing
+    idxs = leaves_of(doc, idx)
+    isempty(idxs) && return nothing
+    return document_bounds([doc[i] for i in idxs])
+end
+
+"""
+    group_arts(doc, indices) -> doc
+
+Wrap the entries at `indices` — a mix of shapes and groups: grouping a
+group into a group (or into a group with shapes) is how nesting is built —
+into a new group appended to the document. Membership is by id, so the
+members keep their doc entries and nothing else moves. Returns the new
+document vector (the group is its last entry; index `length(doc)`).
+"""
+function group_arts(doc::AbstractVector{ArtObject}, indices::AbstractVector{Int})
+    members = UInt[doc[i].id for i in indices if 1 <= i <= length(doc)]
+    isempty(members) && return doc
+    name = string("Group ", count(is_group, doc) + 1)
+    return vcat(doc, [ArtObject(art_next_id(), :group, name,
+                                PolyLine[], 0, members)])
+end
+
+"""
+    ungroup_arts(doc, indices) -> doc
+
+Dissolve the group entries at `indices`, one grouping level each: the group
+nodes go away and their members take the group's place — in their parent
+group's children when the group was nested (LightBurn's ungroup promotes
+into the parent), at the top level otherwise. Members keep their doc
+entries and ids, so nothing else moves.
+"""
+function ungroup_arts(doc::AbstractVector{ArtObject}, indices::AbstractVector{Int})
+    drop = Set(doc[i].id for i in indices
+               if 1 <= i <= length(doc) && is_group(doc[i]))
+    isempty(drop) && return doc
+    dissolved = Dict{UInt,ArtObject}(a.id => a for a in doc if a.id in drop)
+    # A dissolved member's children take its place; when several nested
+    # groups dissolve at once the promotion runs through them (with a seen
+    # guard so a hand-built cyclic document cannot spin).
+    expand(ids, seen) = begin
+        res = UInt[]
+        for c in ids
+            if c in drop && !(c in seen)
+                append!(res, expand(dissolved[c].children, push!(copy(seen), c)))
+            else
+                push!(res, c)
+            end
+        end
+        return res
+    end
+    out = ArtObject[]
+    for a in doc
+        a.id in drop && continue                 # the node dissolves
+        if is_group(a) && any(c -> c in drop, a.children)
+            push!(out, ArtObject(a; children = expand(a.children, Set{UInt}())))
+        else
+            push!(out, a)
+        end
+    end
+    return out
+end
+
+"""
+    delete_arts(doc, indices) -> doc
+
+Remove the entries at `indices` from the document and prune the member
+references that no longer resolve: a deleted shape leaves its group's
+`children`; a deleted group node simply disappears (its members keep their
+own doc entries — an explicitly deleted group is dissolved by this).
+"""
+function delete_arts(doc::AbstractVector{ArtObject}, indices::AbstractVector{Int})
+    dead = Set(doc[i].id for i in indices if 1 <= i <= length(doc))
+    isempty(dead) && return doc
+    out = [a for a in doc if !(a.id in dead)]
+    alive = Set(a.id for a in out)
+    return [is_group(a) && !isempty(setdiff(a.children, dead)) ?
+            ArtObject(a; children = UInt[c for c in a.children if c in alive]) : a
+            for a in out]
+end
+
+"Union bounding box (millimetres, y-up) of the document's art; `nothing` for
+an empty document or one without any outline geometry (a group entry holds
+no paths of its own — its bounds come from its leaves via `art_bounds`)."
 function document_bounds(objs::AbstractVector{ArtObject})
     isempty(objs) && return nothing
     pmin = Point(Inf, Inf)
@@ -77,6 +289,7 @@ function document_bounds(objs::AbstractVector{ArtObject})
             pmax = Point(max.(pmax, p))
         end
     end
+    pmin[1] == Inf && return nothing    # no geometry found
     return (pmin, pmax)
 end
 
@@ -146,10 +359,10 @@ end
 Move an art object by `dx`/`dy` millimetres.
 """
 function translate(art::ArtObject, dx::Float64, dy::Float64)
-    return ArtObject(art.name,
-                     [PolyLine([Point(p[1] + dx, p[2] + dy) for p in pl.points],
-                               pl.closed) for pl in art.paths],
-                     art.layer)
+    return ArtObject(art; paths = [PolyLine([Point(p[1] + dx, p[2] + dy)
+                                             for p in pl.points],
+                                            pl.closed)
+                                   for pl in art.paths])
 end
 
 """
@@ -158,12 +371,12 @@ end
 Scale an art object by `sx`/`sy` about `anchor` (which stays fixed).
 """
 function scale(art::ArtObject, sx::Float64, sy::Float64, anchor::Point)
-    return ArtObject(art.name,
-                     [PolyLine([Point(anchor[1] + (p[1] - anchor[1]) * sx,
-                                      anchor[2] + (p[2] - anchor[2]) * sy)
-                                for p in pl.points], pl.closed)
-                      for pl in art.paths],
-                     art.layer)
+    return ArtObject(art; paths = [PolyLine([Point(anchor[1] +
+                                                       (p[1] - anchor[1]) * sx,
+                                                   anchor[2] +
+                                                       (p[2] - anchor[2]) * sy)
+                                             for p in pl.points], pl.closed)
+                                   for pl in art.paths])
 end
 
 """
@@ -174,15 +387,14 @@ coordinates) about `center`.
 """
 function rotate(art::ArtObject, angle::Float64, center::Point)
     co, si = cos(angle), sin(angle)
-    return ArtObject(art.name,
-                     [PolyLine([begin
-                                    dx = p[1] - center[1]
-                                    dy = p[2] - center[2]
-                                    Point(center[1] + dx * co - dy * si,
-                                          center[2] + dx * si + dy * co)
-                                end for p in pl.points], pl.closed)
-                      for pl in art.paths],
-                     art.layer)
+    return ArtObject(art; paths = [PolyLine([begin
+                                                 dx = p[1] - center[1]
+                                                 dy = p[2] - center[2]
+                                                 Point(center[1] + dx * co - dy * si,
+                                                       center[2] + dx * si + dy * co)
+                                             end for p in pl.points],
+                                            pl.closed)
+                                   for pl in art.paths])
 end
 
 """
@@ -192,7 +404,7 @@ Assign every art object in `arts` to the palette layer `layer` (§4: with a
 selection, clicking a palette swatch recolours the selected objects).
 """
 function set_layer(arts::AbstractVector{ArtObject}, layer::Int)
-    return [ArtObject(obj.name, obj.paths, layer) for obj in arts]
+    return [ArtObject(obj; layer = layer) for obj in arts]
 end
 
 """
@@ -209,9 +421,8 @@ function center_on_workarea(arts::AbstractVector{ArtObject})
     (pmin, pmax) = bounds
     dx = WORK_AREA_MM / 2 - (pmin[1] + pmax[1]) / 2
     dy = WORK_AREA_MM / 2 - (pmin[2] + pmax[2]) / 2
-    return [ArtObject(obj.name,
-                      [PolyLine([Point(p[1] + dx, p[2] + dy) for p in pl.points],
-                                pl.closed) for pl in obj.paths],
-                      obj.layer)
+    return [ArtObject(obj; paths = [PolyLine([Point(p[1] + dx, p[2] + dy)
+                                              for p in pl.points], pl.closed)
+                                    for pl in obj.paths])
             for obj in arts]
 end

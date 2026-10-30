@@ -23,12 +23,15 @@
 const SHELL_WIDTH = 1100
 const SHELL_HEIGHT = 700
 
-"A one-line summary for the status bar, e.g. `unicorn.svg: 37 outlines`."
+"A one-line summary for the status bar, e.g. `unicorn.svg: 37 outlines`.
+Group entries hold no geometry of their own (their members are listed by
+their own files) — the summary counts shapes only."
 function doc_summary(objs::AbstractVector{ArtObject})
-    isempty(objs) && return "no design imported — use File → Open…"
+    shapes = [obj for obj in objs if !is_group(obj)]
+    isempty(shapes) && return "no design imported — use File → Open…"
     parts = [string(obj.name, ": ", length(obj.paths),
                     length(obj.paths) == 1 ? " outline" : " outlines")
-             for obj in objs]
+             for obj in shapes]
     return join(parts, "   ·   ")
 end
 
@@ -350,10 +353,12 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     end
 
     # Keep the spinners in sync when the selection or the document changes.
+    # The selection resolves to its leaf shapes first: a selected group
+    # shows (and moves/scales) its whole subtree's union.
     useEffect(() -> begin
-        sel = selection_obs[]
-        if length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])
-            bounds = document_bounds([doc_obs[][sel[1]]])
+        idxs = resolve_leaves(doc_obs[], selection_obs[])
+        if length(idxs) == 1
+            bounds = document_bounds([doc_obs[][idxs[1]]])
             if bounds !== nothing
                 (ax, ay) = anchor_point(bounds)
                 x_pos[] = ax
@@ -367,16 +372,16 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
 
     "Move the selection so its anchor point lands on `(v, other)`."
     function move_to!(v, axis)
-        sel = selection_obs[]
-        (length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])) || return
-        art = doc_obs[][sel[1]]
+        idxs = resolve_leaves(doc_obs[], selection_obs[])
+        (length(idxs) == 1) || return
+        art = doc_obs[][idxs[1]]
         bounds = document_bounds([art])
         bounds === nothing && return
         (ax, ay) = anchor_point(bounds)
         dx = axis == :x ? v - ax : 0.0
         dy = axis == :y ? v - ay : 0.0
         d = copy(doc_obs[])
-        d[sel[1]] = translate(art, dx, dy)
+        d[idxs[1]] = translate(art, dx, dy)
         doc_obs[] = d
         return nothing
     end
@@ -384,9 +389,9 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     "Scale the selection so its size along `axis` becomes `v`, anchored at
     the 9-dot anchor; the lock makes scaling uniform."
     function resize_to!(v, axis)
-        sel = selection_obs[]
-        (length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])) || return
-        art = doc_obs[][sel[1]]
+        idxs = resolve_leaves(doc_obs[], selection_obs[])
+        (length(idxs) == 1) || return
+        art = doc_obs[][idxs[1]]
         bounds = document_bounds([art])
         bounds === nothing && return
         anchor = anchor_point(bounds)
@@ -398,7 +403,7 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
             axis == :w ? (sy = sx) : (sx = sy)
         end
         d = copy(doc_obs[])
-        d[sel[1]] = scale(art, sx, sy, anchor)
+        d[idxs[1]] = scale(art, sx, sy, anchor)
         doc_obs[] = d
         return nothing
     end
@@ -426,8 +431,7 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     # The translate/scale inputs only act on a single selection; with none
     # (or a multi-selection) they are grayed out. (The toolbar re-renders on
     # selection changes.)
-    has_sel = length(selection_obs[]) == 1 &&
-              1 <= selection_obs[][1] <= length(doc_obs[])
+    has_sel = length(resolve_leaves(doc_obs[], selection_obs[])) == 1
     # A labelled spinner: the label to its left; edits apply to the selection.
     spinner_row(label, obs, apply, step = 1.0) = @rock Row(
         axis_label(label),
@@ -450,9 +454,77 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
         background = t.gradients.toolbar, fill = fill)
 end
 
+# The workspace context menu (§8.15): the Group / Ungroup popup the
+# workspace's right click opens. A component of its own so the items'
+# enablement is click-current: it subscribes to the document and the
+# selection (the shell body would only see a stale snapshot — Rocks
+# re-renders the fibers that read a change, and the shell doesn't read
+# either), so the items rebuild exactly when the selection moves.
+function WorkspaceContextMenu(; doc = Observable(ArtObject[]),
+                              selection = Observable(Int[]),
+                              ctx_open = Observable(false))
+    doc_obs = @use doc
+    selection_obs = @use selection
+
+    "Group action: wrap the selected entries (shapes and/or groups — a
+    selected group joining a new group is how nesting is built) in one new
+    group appended to the document; the selection becomes the new group."
+    function context_group!()
+        idxs = filter(i -> 1 <= i <= length(doc_obs[]), selection_obs[])
+        isempty(idxs) && return nothing
+        d = group_arts(doc_obs[], idxs)
+        doc_obs[] = d
+        selection_obs[] = [length(d)]
+        return nothing
+    end
+
+    "Ungroup action: dissolve every selected group node one level — members
+    promote into the parent group (or to the top level); the selection
+    follows the dissolved groups' members (selected shapes stay selected)."
+    function context_ungroup!()
+        d = doc_obs[]
+        idxs = filter(i -> 1 <= i <= length(d), selection_obs[])
+        isempty(idxs) && return nothing
+        keep_ids = UInt[]
+        gidx = Int[]
+        for i in idxs
+            if is_group(d[i])
+                push!(gidx, i)
+                for c in child_indices(d, d[i])   # the direct member units
+                    push!(keep_ids, d[c].id)
+                end
+            else
+                push!(keep_ids, d[i].id)
+            end
+        end
+        isempty(gidx) && return nothing
+        d1 = ungroup_arts(d, gidx)
+        doc_obs[] = d1
+        sel = Int[]
+        for id in keep_ids
+            i = art_index(d1, id)
+            i !== nothing && push!(sel, i)
+        end
+        selection_obs[] = sort!(sel)
+        return nothing
+    end
+
+    sel_entries = filter(i -> 1 <= i <= length(doc_obs[]), selection_obs[])
+    return @rock E.ContextMenu(
+        open = ctx_open,
+        items = [
+            E.MenuItem(label = "Group", enabled = !isempty(sel_entries),
+                       on_press = context_group!),
+            E.MenuItem(label = "Ungroup",
+                       enabled = any(i -> is_group(doc_obs[][i]), sel_entries),
+                       on_press = context_ungroup!),
+        ])
+end
+
 function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing,
              active_layer = nothing, processes = nothing,
-             editor_open = nothing, edit_layer = nothing, tool = nothing)
+             editor_open = nothing, edit_layer = nothing, tool = nothing,
+             panel_tab = nothing, ctx_open = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
@@ -481,6 +553,16 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     # tool strip and the workspace; injectable for tests.
     tool_internal = @use Observable(:mouse)
     tool = tool === nothing ? tool_internal : tool
+    # The right panel's tab: the layer settings page first, the document
+    # outline second; injectable for tests.
+    panel_tab_internal = @use Observable(1)
+    panel_tab = panel_tab === nothing ? panel_tab_internal : panel_tab
+    # The workspace context menu (Group / Ungroup): the open flag only —
+    # the workspace's right click flips it and the menu anchors itself at
+    # the click. Injected into the Workspace as a prop; injectable for
+    # tests.
+    ctx_open_internal = @use Observable(false)
+    ctx_open = ctx_open === nothing ? ctx_open_internal : ctx_open
     # The workspace/panel split: LightBurn's right dock starts out ~80% of
     # the window; the handle is draggable.
     split_ratio = @use Observable(0.78)
@@ -535,9 +617,10 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
             if key == "Delete"
                 idxs = filter(i -> 1 <= i <= length(doc[]), selection[])
                 if !isempty(idxs)
-                    d = copy(doc[])
-                    deleteat!(d, idxs)
-                    doc[] = d
+                    # Groups delete as entries: a deleted shape is pruned
+                    # from its group's children, a deleted group node
+                    # dissolves (delete_arts in document.jl).
+                    doc[] = delete_arts(doc[], idxs)
                     selection[] = Int[]
                 end
             elseif key == "Escape"
@@ -556,7 +639,8 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                     (@rock Column(
                         (@rock Workspace(doc = doc, selection = selection,
                                          processes = processes, tool = tool,
-                                         active_layer = active_layer;
+                                         active_layer = active_layer,
+                                         ctx_open = ctx_open;
                                          flex = 1, fill = true)),
                         # The layer palette sits as a strip directly below
                         # the workspace — same width as the canvas, outside
@@ -566,15 +650,31 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                                         fill = true));
                         fill = true));
                     (@rock Box(
-                        (@rock CutsLayersPanel(doc = doc, processes = processes,
-                                               editor_open = editor_open,
-                                               edit_layer = edit_layer, fill = true));
-                        padding = 8, fill = true));
+                        (@rock E.TabControl(
+                            tabs = ["Cuts / Layers", "Outline"],
+                            selected = panel_tab,
+                            children = Any[
+                                (@rock CutsLayersPanel(doc = doc,
+                                                       processes = processes,
+                                                       editor_open = editor_open,
+                                                       edit_layer = edit_layer,
+                                                       fill = true;
+                                                       flex = 1)),
+                                (@rock OutlinePanel(doc = doc,
+                                                    selection = selection;
+                                                    fill = true, flex = 1)),
+                            ];
+                            flex = 1, fill = true));
+                        fill = true));
                     direction = :horizontal, ratio = split_ratio,
                     flex = 1, fill = true));
                 gap = 2, fill = true, height = "100%")),
             (@rock ProcessEditor(open = editor_open, layer = edit_layer,
                                  processes = processes)),
+            # The workspace context menu (right click): Group / Ungroup over
+            # the current selection. Anchors at the pointer by default.
+            (@rock WorkspaceContextMenu(doc = doc, selection = selection,
+                                        ctx_open = ctx_open)),
             (@rock E.MessageBox(open = error_open, title = "Import failed",
                                 message = last_error[], icon = :warning)),
         ])

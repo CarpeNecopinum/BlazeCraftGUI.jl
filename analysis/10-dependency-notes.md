@@ -728,11 +728,12 @@ Phase 0/1 start of the roadmap (`09-implementation-roadmap.md`): the app shell +
 | File | Role |
 |---|---|
 | `src/BlazeCraftGUI.jl` | module; re-exports `App`, `ArtObject`, `import_art`, `run_gui`, `FileDialogResult`, `show_open_file_dialog!`; `run_gui(; kw…) = render(App; kw…)` |
-| `src/document.jl` | `ArtObject` (one imported file: name, flattened `PolyLine`s, layer color), `import_art(path)` (SVG via `BlazeCraft.Importers.load_svg`, DXF via `load_dxf_instructions` + `extract_polys`, merged+`flatten`ed once at import), `center_on_workarea` (translates new imports so the union of their bounds sits centered on the 300×300 mm work area, keeping the group's relative positioning), `document_bounds`, `layer_color` (LightBurn palette `00`=black, `01`=blue, `02`=red…), `WORK_AREA_MM` |
+| `src/document.jl` | `ArtObject` (one document entry: unique `id`, `kind` `:shape`/`:group`, name, flattened `PolyLine`s, layer color, group `children` ids), `import_art(path)` (SVG via `BlazeCraft.Importers.load_svg`, DXF via `load_dxf_instructions` + `extract_polys`, merged+`flatten`ed once at import), `center_on_workarea`, `document_bounds`, the group helpers (`is_group`, `art_index`, `child_indices`, `leaves_of`, `resolve_leaves`, `parent_group`, `top_level_indices`, `art_bounds`, `group_arts`/`ungroup_arts`/`delete_arts`, §8.15), `layer_color` (LightBurn palette `00`=black, `01`=blue, `02`=red…), `WORK_AREA_MM` |
 | `src/camera.jl` | `Camera(translation, rotation, scale)` — StaticArrays `SVector`/`SMatrix`; `matrix(cam)` builds the 3×3 affine (translate ∘ rotate ∘ scale with the baked-in y-flip), `apply(m, p)`, `zoom_at` (unprojects the cursor through `inv(matrix)` so the world point under it stays fixed), `pan` |
-| `src/workspace.jl` | the `Workspace` component: `MouseArea(Canvas)` with pan, wheel-zoom, **selection** (clicking a shape's line selects it — `hit_shape` point-to-segment distance in world mm), the marching-dash selection outline (`draw_dashed_polyline`, phase-advanced by a 100 ms `useInterval`), the dashed bounding box and the transform handles (corner squares scale about the opposite corner, the center square translates, the outside rotation handles rotate about the bbox center); the world-space geometry (bed corners + grid segments) is constant and transformed per frame through the camera matrix; `fit_camera` fits the union of the 300×300 mm work area and the document |
+| `src/workspace.jl` | the `Workspace` component: `MouseArea(Canvas)` with pan, wheel-zoom, **selection** (clicking a shape's line selects *its group* — `hit_shape` point-to-segment distance in world mm, the click unit mapped through `parent_group`; Shift toggles at unit level), group-aware marquee (`shapes_in_rect` on the top-level entries: a group acts like a single shape), the marching-dash selection outline (`draw_dashed_polyline`, phase-advanced by a 100 ms `useInterval`, resolved through `resolve_leaves`), the dashed union bounding box and the transform handles (corner squares scale about the opposite corner, the center square translates, the outside rotation handles rotate about the bbox center), the right-click `ctx_open` flip (§8.15); the world-space geometry (bed corners + grid segments) is constant and transformed per frame through the camera matrix; `fit_camera` fits the union of the 300×300 mm work area and the document |
 | `src/filedialog.jl` | `show_open_file_dialog!` — SDL3's native OS dialog (async: the callback only fills an Observable; the main thread consumes it during the next render, where the import runs) |
-| `src/app.jl` | `E.Form` shell: menu bar, the **Position toolbar** (the 3×3 origin grid, X/Y position and W/H size spinners via `E.Spinner`, the aspect lock), `DocStatus` status bar, the Workspace with the **LayerBar strip below the canvas** (§8.14), the Cuts/Layers panel and error MessageBox; app-level `doc`/`selection`/`origin`/`lock` Observables (may be passed in by tests) |
+| `src/app.jl` | `E.Form` shell: menu bar, the **Position toolbar** (the 3×3 origin grid, X/Y position and W/H size spinners via `E.Spinner`, the aspect lock — spinners resolve groups to their subtree union), `DocStatus` status bar, the Workspace with the **LayerBar strip below the canvas** (§8.14), the right dock as a **TabControl** ("Cuts / Layers" page + "Outline" page, §8.15), `WorkspaceContextMenu` (Group/Ungroup over the selection) and the error MessageBox; app-level `doc`/`selection`/`origin`/`lock`/`panel_tab`/`ctx_open` Observables (may be passed in by tests) |
+| `src/outline.jl` | `OutlinePanel` (§8.15): the document outline — an indented tree of every entry with members under their group (shapes a layer-coloured square, groups an outlined box mark); a row click selects exactly that entry; rows scroll in a `ScrollView` |
 | `examples/blazecraft.jl` | entry point; `ROCKS_SCREENSHOT=… SDL_VIDEO_DRIVER=dummy …` headless runs |
 | `test/runtests.jl` | unit tests (import, bounds, palette, summary, camera matrix/zoom_at/pan, `fit_camera`) — 34/34 |
 | **SDL3.jl** (`~/Development/SDL3.jl`) | **new `src/dialog.jl`**: the SDL_dialog.h wrapping — `SDL_DialogFileFilter`, `ShowOpenFileDialog`/`ShowSaveFileDialog`/`ShowOpenFolderDialog`/`ShowFileDialogWithProperties` (892/896 tests pass, 4 broken pre-existing). BlazeCraftGUI's `[sources]` points SDL3 at the local checkout. |
@@ -1234,3 +1235,91 @@ exactly as wide as the canvas, while the doc summary stays alone on the window's
     (the press silently missed the handle and fell through to a marquee). Offset by
     `canvas.rect[1..2]` on the way in, subtract the same on the way out (`scr`/`to_world` helpers in
     the test; gotcha 38's stale-rect rule applies equally to these re-reads).
+
+### 8.15 Groups, context menu, and the outline tab (2026-10-30)
+
+**Document model — groups as entries** (`src/document.jl`): `ArtObject` gained identity and a
+container kind — `id::UInt` (unique, `art_next_id()` counter), `kind::Symbol` (`:shape`/`:group`),
+and `children::Vector{UInt}` (the member ids of a group; shapes and/or other groups, i.e. groups
+nest). The document stays **flat**: a group is one appended entry referencing its members by id —
+the tree is virtual, so grouping moves nothing and un-grouping only removes the node. The plain
+constructor `ArtObject(name, paths, layer)` still builds a fresh-id shape (every import/creation
+path unchanged); edits copy identity through `ArtObject(entry; paths = …)` so a grouped shape keeps
+its membership when translated/scaled/rotated/recoloured. Membership by *id* (never indices) is
+what makes the hierarchy survive every index-shuffling edit.
+
+Derived helpers, all in `document.jl`: `is_group`, `art_index(doc, id)`, `child_indices`,
+`leaves_of(doc, idx)` (a group's outlines *are* its leaves' outlines), `resolve_leaves(doc,
+selection)` (the "what geometry does my selection own" helper every consumer goes through),
+`parent_group` (the *direct* holder — "selecting one shape selects the whole group" means the
+innermost group holding it), `top_level_indices` (the marquee's selection units),
+`art_bounds(doc, idx)` (a group's bbox = the union over its subtree — what makes a group act like a
+single shape), `group_arts` / `ungroup_arts` / `delete_arts`. Ungrouping dissolves **one level**:
+the members take the group's place — in the parent group's children when nested (LightBurn's
+ungroup promotes into the parent), at the top level otherwise. Deleting a shape prunes it from its
+group's `children`; deleting a group node dissolves it.
+
+**Group-aware selection and marquee** (`src/workspace.jl`): a canvas click maps the hit leaf
+through `parent_group` — the click unit is the innermost group holding the shape (the shape itself
+when top level); Shift toggles at unit level. The marquee (`shapes_in_rect`) now compares the
+*top-level entries* against the rect — a group acts like a single shape: green (overlap) joins the
+whole unit via its combined bounds, red (containment) needs the whole unit inside; a partially
+covered group falls out entirely either way. `selection_union_bbox` and the marching dashes
+resolve through `resolve_leaves`, so a selected group frames and dashes its whole subtree. The
+frame-drag handlers resolve the selection to leaves (`drag_sel`/`drag_art`), so the transforms act
+on exactly the geometry the selection owns.
+
+**Right-click context menu** (`WorkspaceContextMenu` in `src/app.jl`): the workspace's
+`on_down(button 3)` flips a `ctx_open` Observable prop (not while a drag runs; the selection stays
+as it is and the menu's items act on it). Rocks' `E.ContextMenu` gained **pointer anchoring**:
+`x`/`y` omitted (or `nothing`) defer to the owning window's last pointer position — the click that
+flipped `open` was dispatched before the render, so `LAST_POINTER` already holds its coordinates
+(+2 nudge keeps the cursor hot pixel off the first row). The menu is the app's own component
+(doc-level actions, like Delete), rendering `Group` / `Ungroup` items whose *enablement follows the
+selection*: Group is off with nothing selected, Ungroup is off when the selection holds no group
+node. A disabled item ignores presses entirely (the menu stays open); the first click elsewhere
+dismisses the menu and is swallowed as the gesture.
+
+![Context menu: Group enabled, Ungroup disabled for an ungrouped selection](analysis/images/screenshots/blazecraft-context-menu.png)
+
+**Right panel → tabber with a document outline** (`src/outline.jl`): the Cuts/Layers panel and the
+new `OutlinePanel` are pages of an `E.TabControl` (`tabs = ["Cuts / Layers", "Outline"]`, selected
+= an injectable Observable). The outline is an indented tree of every entry with members indented
+under their group (shapes carry a square in their layer colour, groups an outlined box mark); the
+tree is virtual — it reads the flat document and walks `child_indices`, so it needs no state. A
+row click selects **exactly** that entry: a shape row selects only the shape (never a parent
+group), a group row selects the group (its members follow by membership). Rows live in a
+`ScrollView` so long documents scroll.
+
+![Outline tab: nested groups, indented members, exact-entry selection](analysis/images/screenshots/blazecraft-outline.png)
+
+**Gotchas**:
+
+49. **`document_bounds` on a group entry poisoned every consumer** — the loop never executes for
+    an entry with no paths, so it returned `(Inf…, -Inf…)` instead of `nothing` and the Position
+    toolbar's effect happily wrote `NaN`/`-Inf` into the spinners. It now returns `nothing` when no
+    geometry was found; a group's bounds must go through `art_bounds` (the union over its leaves).
+50. **The shell body does not re-render on selection changes** — Rocks re-renders the *fibers that
+    read a change* (`@use` subscribers); a plain `selection[]` read in the `App` body builds a
+    stale snapshot, and the context menu's items stayed disabled after the selection moved. State
+    that must be click-current belongs in its own small component that `@use`s what it needs
+    (`WorkspaceContextMenu`), not in the shell body.
+51. **`MouseArea` stretches a *single* `fill = true` child over the whole area** — mounting the
+    context menu as a second child of the workspace's `MouseArea` collapsed the canvas to 0 height
+    (the special case requires exactly one fill child). Window-level overlays (a context menu, a
+    message box) are siblings in the app's tree, not siblings of the canvas.
+52. **`fill` on a flow child stretches the *cross* axis only** — in a column container a `fill`
+    child gets the container's width and its own natural height. A docked tab control needs
+    `flex = 1` (the parent consumes it and grows the child's height; the component function never
+    sees it), and the tab *page* needs `height = "100%"` (a percentage resolves against the
+    container at placement) so the page fills the control. Component fibers size their output
+    element by the size the parent gave *the component* — a `height = "100%"` on the returned
+    element resolves against nothing; the component call itself carries the flex prop.
+53. **The renderer of SDL's override-redirect popup aborts the process** — the first right-click
+    crashed the GUI with an X `BadValue` in `X_GLXCreateContext`: Rocks' popup windows used
+    `SDL_WINDOW_POPUP_MENU` (override-redirect on X11), and `create_window!` creates a renderer for
+    *every* window — GLX on the popup's override-redirect drawable kills the process (headless
+    never sees it: `CreatePopupWindow` fails there and the fallback path was exercised instead;
+    the isolated SDL call `CreatePopupWindow` itself is fine, the *renderer* is not). Popup windows
+    are now plain `BORDERLESS | ALWAYS_ON_TOP` windows positioned relative to their owner — the
+    renderer works on those, and the menu's dismissal is in-app (`close_open_menus!`) anyway.

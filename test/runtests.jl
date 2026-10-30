@@ -8,7 +8,6 @@ using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     layer_color, ArtObject
 using BlazeCraft.Shapes: PolyLine, Point
 using StaticArrays: SVector
-using StaticArrays: SVector
 
 @testset "document model" begin
     @testset "import_art: svg" begin
@@ -1163,5 +1162,418 @@ end
         # status bar region's summary stays separate).
         @test cx0 >= canvas.rect[1] - 2
         @test cx1 <= canvas.rect[1] + canvas.rect[3] + 2
+    end
+end
+
+@testset "groups: document model" begin
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    a = ArtObject("a", [ring(100.0, 100.0, 200.0, 160.0)], 0)
+    b = ArtObject("b", [ring(40.0, 190.0, 140.0, 240.0)], 2)
+    c = ArtObject("c", [ring(220.0, 100.0, 260.0, 140.0)], 1)
+
+    @testset "group_arts: members by id, appended last" begin
+        d = group_arts([a, b, c], [1, 2])
+        @test length(d) == 4
+        g = d[4]
+        @test is_group(g)
+        @test g.name == "Group 1"
+        @test g.children == UInt64[a.id, b.id]
+        # The members keep their doc entries untouched.
+        @test d[1].paths == a.paths && d[2].paths == b.paths
+        # Nesting: a group joining a group (or a group + shape) nests.
+        d2 = group_arts(d, [4, 3])
+        @test length(d2) == 5
+        outer = d2[5]
+        @test is_group(outer) && outer.name == "Group 2"
+        @test outer.children == UInt64[g.id, c.id]
+    end
+
+    @testset "resolve_leaves / parent_group / top_level_indices" begin
+        d = group_arts([a, b, c], [1, 2])
+        d2 = group_arts(d, [4, 3])
+        # A group index expands into its whole subtree; shapes pass through.
+        @test resolve_leaves(d2, [5]) == [1, 2, 3]
+        @test resolve_leaves(d2, [1, 5]) == [1, 2, 3]
+        # The parent group is the *direct* holder: a/b sit in the inner
+        # group, c in the outer one; the outer group itself is top level.
+        @test parent_group(d2, 1) == 4
+        @test parent_group(d2, 3) == 5
+        @test parent_group(d2, 5) === nothing
+        # Top-level entries: the outermost group only.
+        @test top_level_indices(d2) == [5]
+        @test top_level_indices(group_arts([a, b, c], [1, 2])) == [3, 4]
+    end
+
+    @testset "art_bounds: a group bounds its subtree" begin
+        d = group_arts([a, b, c], [1, 2])
+        @test art_bounds(d, 4) == ((Point(40.0, 100.0), Point(200.0, 240.0)))
+        @test art_bounds(d, 1) == ((Point(100.0, 100.0), Point(200.0, 160.0)))
+        @test art_bounds(d, 0) === nothing
+    end
+
+    @testset "marquee units: a group acts like a single shape" begin
+        d = group_arts([a, b, c], [1, 2])
+        # Green (overlap) touching one member's corner selects the group.
+        @test shapes_in_rect(d, ((195.0, 155.0), (210.0, 170.0)),
+                             :overlapping) == [4]
+        # Red (contained) holding the whole group selects it.
+        @test shapes_in_rect(d, ((30.0, 90.0), (210.0, 250.0)),
+                             :contained) == [4]
+        # Red over part of the group selects nothing of it.
+        @test shapes_in_rect(d, ((90.0, 90.0), (150.0, 250.0)),
+                             :contained) == Int[]
+        # The ungrouped shape still selects alone.
+        @test shapes_in_rect(d, ((215.0, 90.0), (270.0, 150.0)),
+                             :overlapping) == [3]
+    end
+
+    @testset "ungroup_arts: one level per dissolve" begin
+        d = group_arts([a, b, c], [1, 2])
+        d2 = group_arts(d, [4, 3])
+        # Ungrouping the inner group promotes its members into the outer.
+        d3 = ungroup_arts(d2, [4])
+        @test length(d3) == 4
+        outer = d3[art_index(d3, d2[5].id)]
+        @test outer.children == UInt64[a.id, b.id, c.id]
+        @test art_index(d3, d2[4].id) === nothing
+        # Ungrouping the outer group only leaves the inner group top level.
+        d4 = ungroup_arts(d2, [5])
+        @test [x.name for x in d4] == ["a", "b", "c", "Group 1"]
+        @test is_group(d4[4])
+        # Both at once: everything promotes to the top level.
+        d5 = ungroup_arts(d2, [4, 5])
+        @test [x.name for x in d5] == ["a", "b", "c"]
+        @test all(x -> !is_group(x), d5)
+        # Ungrouping a non-group selection is a no-op.
+        @test ungroup_arts(d2, [1]) === d2
+    end
+
+    @testset "delete_arts: prune member references" begin
+        d = group_arts([a, b, c], [1, 2])
+        # A deleted shape leaves its group's children.
+        d2 = delete_arts(d, [1])
+        g = d2[art_index(d2, d[4].id)]
+        @test g.children == UInt64[b.id]
+        # A deleted group node dissolves; the members keep their entries.
+        d3 = delete_arts(d, [4])
+        @test [x.name for x in d3] == ["a", "b", "c"]
+        # Group + shape at once.
+        d4 = delete_arts(d, [1, 4])
+        @test [x.name for x in d4] == ["b", "c"]
+    end
+
+    @testset "edits keep identity: group membership survives" begin
+        d = group_arts([a, b, c], [1, 2])
+        moved = translate(d[1], 5.0, 5.0)
+        @test moved.id == d[1].id
+        recoloured = set_layer([d[1]], 3)
+        @test recoloured[1].id == d[1].id
+        # After moving a member, the group still resolves to it.
+        d2 = [ArtObject(art; paths = translate(art, 5.0, 5.0).paths)
+              for art in d]
+        @test leaves_of(d2, 4) == [1, 2]
+        @test d2[4].children == d[4].children
+    end
+
+    @testset "summary and layers skip groups" begin
+        d = group_arts([a, b, c], [1, 2])
+        @test occursin("a: 1 outline", doc_summary(d))
+        @test !occursin("Group 1", doc_summary(d))
+        @test document_layers(d) == [0, 1, 2]
+    end
+end
+
+@testset "context menu: group and ungroup" begin
+    # The right-click path through the real event pipeline: the click opens
+    # the app's context menu as its own popup window anchored at the
+    # pointer; Group wraps the selection, Ungroup dissolves the group nodes
+    # one level. A disabled item ignores presses (the menu stays open); the
+    # first click elsewhere dismisses the menu (swallowed).
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    ctx_open = Observable(false)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = [ArtObject("a", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+             ArtObject("b", [ring(40.0, 190.0, 140.0, 240.0)], 2)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              ctx_open = ctx_open)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        m = matrix(cam)
+        pt(p) = begin
+            s = apply(m, p)
+            (round(Int, canvas.rect[1] + s[1]),
+             round(Int, canvas.rect[2] + s[2]))
+        end
+        item(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        popups(wins) = filter(w -> Bool(get(w.props, :popup, false)), wins)
+        right_click(p) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(p[1]), Float32(p[2]); button = 3)
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        marquee(from, to) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(from[1]), Float32(from[2]))
+            Rocks.drain_events!()
+            Rocks.push_motion!(canvas, to[1], to[2])
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(to[1]), Float32(to[2]))
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        p = pt(SVector(260.0, 60.0))
+
+        # Right-click on empty space opens the menu at the click (the
+        # popup is its own window; the flag the click flipped drove it).
+        right_click(p)
+        @test ctx_open[]
+        windows = Rocks.sync_windows!(root)
+        @test length(windows) == 2
+        popup = only(popups(windows))
+        @test get(popup.props, :menu_open, nothing) === ctx_open
+        # Anchored at the pointer (+ the nudge): the popup's own x/y.
+        @test get(popup.props, :x, 0) == p[1] + 2
+        @test get(popup.props, :y, 0) == p[2] + 2
+
+        # Nothing is selected yet: Group is disabled and ignores the press
+        # (the menu stays open).
+        group_item = item(popup, "Group")
+        @test group_item !== nothing
+        @test Bool(get(group_item.props, :disabled, false))
+        Rocks.click!(group_item)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 2
+        @test ctx_open[]
+
+        # A click elsewhere dismisses the open menu (swallowed).
+        c0 = pt(SVector(50.0, 210.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          Float32(c0[1]), Float32(c0[2]))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test !ctx_open[]
+        @test selection[] == Int[]
+
+        # Select both shapes with a marquee, then Group via the menu.
+        marquee(pt(SVector(250.0, 260.0)), pt(SVector(60.0, 60.0)))
+        @test selection[] == [1, 2]
+        right_click(p)
+        windows = Rocks.sync_windows!(root)
+        popup = only(popups(windows))
+        group_item = item(popup, "Group")
+        @test !Bool(get(group_item.props, :disabled, false))
+        Rocks.click!(group_item)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 3
+        @test is_group(doc[][3])
+        @test doc[][3].children == UInt64[doc[][1].id, doc[][2].id]
+        @test selection[] == [3]
+        # The menu closed with the item's action.
+        windows = Rocks.sync_windows!(root)
+        @test isempty(popups(windows))
+
+        # Clicking a member now selects the whole group (canvas click on
+        # a's outline).
+        c1 = pt(SVector(150.0, 100.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          Float32(c1[1]), Float32(c1[2]))
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                          Float32(c1[1]), Float32(c1[2]))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [3]
+
+        # Ungroup dissolves the group; the selection follows the members.
+        right_click(p)
+        windows = Rocks.sync_windows!(root)
+        popup = only(popups(windows))
+        ungroup_item = item(popup, "Ungroup")
+        @test ungroup_item !== nothing
+        @test !Bool(get(ungroup_item.props, :disabled, false))
+        Rocks.click!(ungroup_item)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 2
+        @test selection[] == [1, 2]
+        windows = Rocks.sync_windows!(root)
+        @test isempty(popups(windows))
+    end
+end
+
+@testset "group selection: clicks and marquee units" begin
+    # With a group in the document, a canvas click on a member selects the
+    # group, Shift toggles at unit level, and the marquee compares the
+    # top-level entries (a group acts like a single shape).
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts([ArtObject("a", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+                        ArtObject("b", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+                        ArtObject("c", [ring(220.0, 100.0, 260.0, 140.0)], 1)],
+                       [1, 2])   # [a, b, c, Group 1(a, b)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        m = matrix(cam)
+        pt(p) = begin
+            s = apply(m, p)
+            (round(Int, canvas.rect[1] + s[1]),
+             round(Int, canvas.rect[2] + s[2]))
+        end
+        click_at(p; mod = UInt16(0)) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(p[1]), Float32(p[2]); mod = mod)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(p[1]), Float32(p[2]); mod = mod)
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        marquee(from, to) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(from[1]), Float32(from[2]))
+            Rocks.drain_events!()
+            Rocks.push_motion!(canvas, to[1], to[2])
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(to[1]), Float32(to[2]))
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+
+        # Clicking a member selects the group (a's outline).
+        click_at(pt(SVector(150.0, 100.0)))
+        @test selection[] == [4]
+        # Shift+click the ungrouped shape adds it at unit level.
+        click_at(pt(SVector(240.0, 100.0)); mod = 0x0001)
+        @test sort(selection[]) == [3, 4]
+        # Shift+click again removes it.
+        click_at(pt(SVector(240.0, 100.0)); mod = 0x0001)
+        @test selection[] == [4]
+
+        # The selection frame encloses the group's subtree union.
+        bbox = selection_union_bbox(m, doc[], selection[])
+        want = selection_union_bbox(m, doc[], [1, 2])
+        @test bbox == want
+
+        # Green marquee touching only the group selects it as a unit (the
+        # ungrouped shape stays out).
+        marquee(pt(SVector(195.0, 250.0)), pt(SVector(150.0, 60.0)))
+        @test selection[] == [4]
+        # Green over everything selects both units.
+        marquee(pt(SVector(270.0, 260.0)), pt(SVector(30.0, 60.0)))
+        @test sort(selection[]) == [3, 4]
+        # Red over part of the group selects nothing of it.
+        marquee(pt(SVector(90.0, 60.0)), pt(SVector(150.0, 250.0)))
+        @test isempty(selection[])
+        # Red fully containing the group selects it.
+        marquee(pt(SVector(30.0, 60.0)), pt(SVector(210.0, 250.0)))
+        @test selection[] == [4]
+    end
+end
+
+@testset "right panel tabs and outline" begin
+    # The right dock is a tab control: the layer settings first, the
+    # document outline second. Outline rows list every entry with members
+    # indented under their group; a row click selects exactly that entry.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(1)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts(group_arts(
+        [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+         ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+         ArtObject("gamma", [ring(220.0, 100.0, 260.0, 140.0)], 1)],
+        [1, 2]), [4, 3])
+    # [alpha, beta, gamma, Group 1(alpha, beta), Group 2(Group 1, gamma)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+
+        # Page 1: the layers list (the doc has geometry); no outline rows.
+        @test Rocks.find_by_label(main, "00") !== nothing
+        @test Rocks.find_by_label(main, "alpha") === nothing
+
+        # Switch to the outline tab: the tree shows every entry.
+        panel_tab[] = 2
+        Rocks.perform_render!(root)
+        Rocks.run_effects!()
+        Rocks.flush_dirty!()
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        @test Rocks.find_by_label(main, "no layers yet") === nothing
+        @test Rocks.find_by_label(main, "alpha") !== nothing
+        @test Rocks.find_by_label(main, "beta") !== nothing
+        @test Rocks.find_by_label(main, "gamma") !== nothing
+        @test Rocks.find_by_label(main, "Group 1") !== nothing
+        @test Rocks.find_by_label(main, "Group 2") !== nothing
+
+        # A shape row selects exactly that shape — never its parent group.
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        Rocks.click!(row(main, "alpha"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [1]
+
+        # A group row selects the group (its members follow by membership).
+        Rocks.click!(row(main, "Group 1"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [4]
+
+        # The outermost group row selects the whole outer group.
+        Rocks.click!(row(main, "Group 2"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [5]
     end
 end

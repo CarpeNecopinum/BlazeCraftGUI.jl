@@ -17,13 +17,17 @@ include("fills.jl")
 include("filedialog.jl")
 include("icons.jl")
 include("workspace.jl")
+include("outline.jl")
 include("app.jl")
 
 "Run the app window (headless runs accept `frames = n, screenshot = \"…\"`)."
 run_gui(; kw...) = render(App; kw...)
 
-export App, PositionToolbar, LayerBar, CutsLayersPanel, ProcessEditor, ToolsPanel,
-       rect_art, ArtObject, import_art, center_on_workarea,
+export App, PositionToolbar, LayerBar, CutsLayersPanel, OutlinePanel, ProcessEditor,
+       ToolsPanel,
+       rect_art, ArtObject, is_group, import_art, center_on_workarea,
+       group_arts, ungroup_arts, delete_arts, resolve_leaves, parent_group,
+       top_level_indices, leaves_of, child_indices, art_index, art_bounds,
        translate, scale, rotate, set_layer, layer_color, layer_label,
        is_tool_layer, CUT_LAYERS, LAYER_COLORS_HEX, MODES, mode_label,
        CutSettings, Process, document_layers, process_for, with_process,

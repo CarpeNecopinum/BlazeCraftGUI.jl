@@ -67,6 +67,7 @@ have no cut parameters and never appear.
 function document_layers(arts::AbstractVector{ArtObject})
     layers = Int[]
     for art in arts
+        is_group(art) && continue        # groups hold no geometry, never cut
         is_tool_layer(art.layer) && continue
         art.layer in layers || push!(layers, art.layer)
     end
