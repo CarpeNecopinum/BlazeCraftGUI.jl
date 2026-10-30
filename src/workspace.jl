@@ -163,6 +163,34 @@ function hit_shape(m, doc, x, y, threshold)
 end
 
 """
+    shapes_in_rect(doc, rect, mode) -> Vector{Int}
+
+The indices of the shapes a **marquee** rectangle `rect` (two world-mm
+corners) selects, ascending:
+
+  - `mode = :contained` — only shapes entirely inside the rect (the red
+    marquee, started at one of its left corners),
+  - `mode = :overlapping` — every shape whose bounding box intersects the
+    rect (the green marquee, started at one of its right corners).
+"""
+function shapes_in_rect(doc, rect, mode)
+    (a, b) = rect
+    r = (min(a[1], b[1]), min(a[2], b[2]), max(a[1], b[1]), max(a[2], b[2]))
+    out = Int[]
+    for (idx, obj) in enumerate(doc)
+        bo = document_bounds([obj])
+        bo === nothing && continue
+        ok = mode === :contained ?
+             (bo[1][1] >= r[1] && bo[2][1] <= r[3] &&
+              bo[1][2] >= r[2] && bo[2][2] <= r[4]) :
+             !(bo[2][1] < r[1] || bo[1][1] > r[3] ||
+               bo[2][2] < r[2] || bo[1][2] > r[4])
+        ok && push!(out, idx)
+    end
+    return out
+end
+
+"""
     selection_bbox(m, doc, idx) -> (x0, y0, x1, y1)
 
 The selected shape's bounding rectangle in canvas-local pixels (y-down), or
@@ -177,6 +205,45 @@ function selection_bbox(m, doc, idx)
     return (min(c1[1], c2[1]), min(c1[2], c2[2]),
             max(c1[1], c2[1]), max(c1[2], c2[2]))
 end
+
+"""
+    selection_union_bbox(m, doc, selection) -> (x0, y0, x1, y1)
+
+The bounding rectangle (canvas-local pixels, y-down) of *all* selected
+shapes — their world bounds united and projected. The selection frame and
+its handles enclose this union, so with several shapes selected every
+operation applies relative to the combined centre of bounds. The result is
+snapped to **pixel corners** (`square_px`): endpoints sitting on pixel
+centres make SDL's line raster spill into the neighbouring row/column and
+the frame's 1 px lines draw 2 px wide (shapes' own outlines keep float
+precision — this snapping is render-pixel only, never world geometry).
+"""
+function selection_union_bbox(m, doc, selection)
+    bounds = nothing
+    for idx in selection
+        1 <= idx <= length(doc) || continue
+        b = document_bounds([doc[idx]])
+        b === nothing && continue
+        bounds = bounds === nothing ? b :
+                 (min.(bounds[1], b[1]), max.(bounds[2], b[2]))
+    end
+    bounds === nothing && return nothing
+    c1 = apply(m, SVector(bounds[1][1], bounds[1][2]))
+    c2 = apply(m, SVector(bounds[2][1], bounds[2][2]))
+    bbox = (min(c1[1], c2[1]), min(c1[2], c2[2]),
+            max(c1[1], c2[1]), max(c1[2], c2[2]))
+    return snap_px.(bbox)
+end
+
+"""
+    snap_px(p) -> Float64
+
+Snap a projected coordinate to the **corner** of the pixel it falls in
+(`floor(p) + 0.5`): SDL's renderer covers both endpoint pixels (and spills
+one further at whole-integer endpoints), so only corner-aligned endpoints
+keep an orthogonal 1 px line on every renderer.
+"""
+snap_px(p) = floor(Float64(p)) + 0.5
 
 "The handle square size in px."
 const HANDLE_PX = 9.0
@@ -299,8 +366,11 @@ end
 
 Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm grid
 with thicker 100 mm majors, the document's outlines (one stroke color per
-layer) — and, for every selected shape, its marching-dash outline and a
-dashed bounding box; a single selection also gets the transform handles.
+layer), the selected shapes' marching-dash outlines — and **one** selection
+frame with transform handles that encloses the *union* of the selection (a
+single selected shape gets its own bbox; several shapes share the frame
+around them all, and each operation applies relative to the combined centre
+of bounds).
 
 `processes` carries the per-layer process assignment: layers whose mode is
 `fill` or `offset_fill` render their closed geometry as an **even-odd**
@@ -312,12 +382,22 @@ unchanged fill.
 
 `preview` = `((x0, y0), (x1, y1))` (world millimetres), the rectangle
 tool's in-progress drag, drawn dashed in `preview_color` above the document.
+
+`marquee` = `((sx, sy), (cx, cy))` (world millimetres), the cursor tool's
+in-progress selection drag, drawn dashed; its colour encodes the mode —
+green when the drag started at one of the rect's right corners (selects
+everything *overlapping* the rect) and red when it started at a left corner
+(selects only shapes fully *contained* in it). Both selection decorations
+(marquee and selection frame) snap to pixel corners before drawing
+(`snap_px`), so their 1 px lines never widen to 2 px; the document geometry
+itself keeps float precision.
 """
 function draw_workspace(ctx, camera, doc, selection, dash_phase;
                         processes = Dict{Int,Process}(),
                         fill_cache = Dict{Int,Any}(),
                         preview = nothing,
-                        preview_color = (0.1, 0.1, 0.1))
+                        preview_color = (0.1, 0.1, 0.1),
+                        marquee = nothing)
     _, _, cw, ch = ctx.rect
     m = matrix(camera)
     ctx.clear((0.86, 0.87, 0.89))          # tone outside the work area
@@ -377,36 +457,55 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                              dash = 5.0, gap = 3.0, closed = true)
     end
 
-    # The selection decoration: a marching-dash outline and dashed bounding
-    # box per selected shape; a single selection also gets the transform
-    # handles.
+    # The cursor tool's in-progress marquee: dashed, green for an overlap
+    # marquee (started at a right corner) and red for a containment marquee
+    # (started at a left corner). Selection boxes snap to pixel corners
+    # (`snap_px`) — endpoints on pixel centres or sub-pixel floats spill
+    # the line into the neighbouring row and it draws 2 px wide (document
+    # geometry stays float).
+    if marquee !== nothing
+        (a, b) = marquee
+        pa = apply(m, a)
+        pb = apply(m, b)
+        color = pa[1] > pb[1] ? (0.15, 0.75, 0.25) : (0.9, 0.25, 0.2)
+        pa = snap_px.(pa)
+        pb = snap_px.(pb)
+        draw_dashed_polyline(ctx, [(pa[1], pa[2]), (pb[1], pa[2]),
+                                   (pb[1], pb[2]), (pa[1], pb[2]),
+                                   (pa[1], pa[2])];
+                             color = color, width = 1.5,
+                             dash = 5.0, gap = 3.0, closed = true)
+    end
+
+    # The selection decor: the selected shapes' outlines already run the
+    # marching dashes (above); one frame with transform handles encloses
+    # the union of the selection (a multi-selection shares the frame and
+    # its operations act on all of the shapes relative to the combined
+    # centre of bounds). The frame comes pre-snapped to pixel corners from
+    # `selection_union_bbox`; the handle squares ride on the snapped
+    # corners (their ±4.5 size keeps square edges aligned to one grid,
+    # corner or centre).
     if !isempty(selection)
-        for idx in selection
-            bbox = selection_bbox(m, doc, idx)
-            bbox === nothing && continue
+        bbox = selection_union_bbox(m, doc, selection)
+        if bbox !== nothing
             (x0, y0, x1, y1) = bbox
             draw_dashed_polyline(ctx, [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
                                  color = (0.15, 0.35, 0.9), width = 1.0,
                                  dash = 4.0, gap = 3.0, phase = dash_phase)
-        end
-        if length(selection) == 1
-            bbox = selection_bbox(m, doc, selection[1])
-            if bbox !== nothing
-                handles = selection_handles(bbox)
-                # Thin lines from the corners out to the rotation handles.
-                for (corner, rot) in zip(handles.corners, handles.rotate)
-                    ctx.line(corner[1], corner[2], rot[1], rot[2];
-                             color = (0.15, 0.35, 0.9), width = 1.0)
-                end
-                for (hx, hy) in handles.rotate
-                    draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
-                end
-                for (hx, hy) in handles.corners
-                    draw_handle(ctx, hx, hy)
-                end
-                (hx, hy) = handles.center
-                draw_handle(ctx, hx, hy; fill = (0.15, 0.35, 0.9))
+            handles = selection_handles(bbox)
+            # Thin lines from the corners out to the rotation handles.
+            for (corner, rot) in zip(handles.corners, handles.rotate)
+                ctx.line(corner[1], corner[2], rot[1], rot[2];
+                         color = (0.15, 0.35, 0.9), width = 1.0)
             end
+            for (hx, hy) in handles.rotate
+                draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
+            end
+            for (hx, hy) in handles.corners
+                draw_handle(ctx, hx, hy)
+            end
+            (hx, hy) = handles.center
+            draw_handle(ctx, hx, hy; fill = (0.15, 0.35, 0.9))
         end
     end
     return nothing
@@ -440,17 +539,24 @@ end
     Workspace(; doc, selection, props...)
 
 The interactive workspace. `doc` is an `Observable{Vector{ArtObject}}` owned
-by the app and `selection` an `Observable{Union{Nothing,Int}}` (the selected
-shape's index). Clicking one of a shape's lines selects it; the selection
-shows a marching-dash outline, a dashed bounding box and transform handles
-(corner squares scale, the center square translates, the outside rotation
-handles rotate). The workspace also supports pan (drag on empty space) and
-wheel-zoom-at-cursor, and refits the view when a new import changes the
-object count. Layout props (`flex`, `fill`, `height`, …) given to the
-component are forwarded onto the `MouseArea` — inside a `Form`'s scroll
-column the component needs `flex = 1, fill = true, height = "100%"` to fill
-the client area, because the scroll content never gives `flex` extra space
-to grow into.
+by the app and `selection` an `Observable{Vector{Int}}` (the selected
+shapes' indices). A left click on a shape selects it (Shift adds/removes
+of the multi-selection — the Shift has to be held *while* clicking — empty
+space starts a **marquee**: dragging rightward (from a left corner) draws
+the red containment marquee, dragging leftward (from a right corner) the
+green overlap marquee; a click-shaped drag without movement clears the
+selection); the selection gets a marching-dash outline per shape and one
+frame with transform handles around the *union* of the selection (corner
+squares scale everything relative to the frame's fixed opposite corner, the
+center square translates, the outside rotation handles rotate around the
+combined centre of bounds). The camera moves with a **middle-button drag**
+— the pointer turns into the gripping hand while grabbed, plain hover keeps
+the arrow — and zooms at the wheel cursor; the view refits when a new import
+changes the object count. Layout props (`flex`, `fill`, `height`, …) given
+to the component are forwarded onto the `MouseArea` — inside a `Form`'s
+scroll column the component needs `flex = 1, fill = true, height = "100%"`
+to fill the client area, because the scroll content never gives `flex`
+extra space to grow into.
 """
 function Workspace(; doc = Observable(ArtObject[]),
                    selection = Observable(Int[]),
@@ -477,17 +583,27 @@ function Workspace(; doc = Observable(ArtObject[]),
     # Suppressor for the count-refit below: a created rectangle changes the
     # object count (like an import does) but must not refit the view.
     no_refit = @use Ref(false)
-    # The active drag: the mode (:translate/:scale_N/:rotate_N/:rect), the
-    # dragged shape's original geometry, its original world bbox and the
-    # start point.
+    # The active drag: the mode (:translate/:scale_N/:rotate_N/:rect/:pan/
+    # :marquee), the dragged shapes (their indices in `drag_sel`, their
+    # original geometry in `drag_art`), the frame bbox the drag started on
+    # (screen px) and the start point.
     drag_mode = @use Ref(:none)
+    drag_sel = @use Ref{Any}(Int[])
     drag_art = @use Ref{Any}(nothing)
     drag_bbox = @use Ref{Any}(nothing)
     drag_start = @use Ref((0.0, 0.0))
+    # Pan drag: the camera at the moment the middle button was pressed; the
+    # dragged camera position follows the screen delta (camera.jl `pan`).
+    pan_cam = @use Ref(Camera((0.0, 0.0), 0.0, 1.0))
     # Rectangle tool: the world-space corner dragged so far, re-rendered as
     # an observable (the preview must draw on every motion event). The drag
     # start lives in `drag_start`.
     rect_drag = @use Observable{Union{Nothing,Tuple{Float64,Float64}}}(nothing)
+    # Cursor tool: the in-progress marquee, `(start, current)` world corners,
+    # re-rendered per motion like the rect preview.
+    marquee = @use Observable{Union{Nothing,
+                                    Tuple{SVector{2,Float64},
+                                          SVector{2,Float64}}}}(nothing)
 
     # Refit when a new import changes the object count (an edit keeps the
     # count, so moving/scaling a shape never refits the view). A created
@@ -514,10 +630,14 @@ function Workspace(; doc = Observable(ArtObject[]),
         nothing
     end, 100)
 
-    "Write a modified copy of the shape at `idx` back into the document."
-    function replace_art!(idx, art)
+    "Write transformed copies of the selected shapes back into the document
+    (one document write per move event — every shape of the group at once)."
+    function replace_arts!(idxs, arts)
         d = copy(doc_obs[])
-        d[idx] = art
+        for (i, a) in zip(idxs, arts)
+            1 <= i <= length(d) || continue
+            d[i] = a
+        end
         doc_obs[] = d
         return nothing
     end
@@ -538,12 +658,23 @@ function Workspace(; doc = Observable(ArtObject[]),
                                fill_cache = fill_caches[],
                                preview = rect_drag[] === nothing ? nothing :
                                          (drag_start[], rect_drag[]),
-                               preview_color = layer_color(active_obs[]))
+                               preview_color = layer_color(active_obs[]),
+                               marquee = marquee[])
             end,
             # The bed tone distinguishes the canvas from the desktop gray
             # that Tools panels use in Rocks' Enterprise theme.
             background = (0.86, 0.87, 0.89), fill = true);
-        on_down = (x, y, _) -> begin
+        on_down = (x, y, button) -> begin
+            # Middle button: start a pan — grab the camera and drag the view
+            # around (the gripping hand shows while grabbed). A pan keeps the
+            # active tool and the selection.
+            if button == 2 && drag_mode[] === :none
+                drag_mode[] = :pan
+                drag_start[] = (x, y)
+                pan_cam[] = view[]
+                return nothing
+            end
+            button == 1 || return nothing      # other buttons: no action yet
             # Rectangle tool: start a creation drag; no selection changes.
             if tool_obs[] === :rect
                 w = inv(matrix(view[])) * SVector(x, y, 1.0)
@@ -553,15 +684,19 @@ function Workspace(; doc = Observable(ArtObject[]),
                 return nothing
             end
             sel = selection_obs[]
-            # 1. Transform handles of a single selection (multi-selection
-            # draws dashes only; per-shape transform comes later).
-            if length(sel) == 1 && 1 <= sel[1] <= length(doc_obs[])
-                bbox = selection_bbox(matrix(view[]), doc_obs[], sel[1])
+            # 1. Transform handles of the selection frame: one frame encloses
+            # the union of the whole selection, so its operations act on
+            # every selected shape relative to the combined centre of bounds
+            # (a single selection is the same frame around its own bbox).
+            if !isempty(sel)
+                bbox = selection_union_bbox(matrix(view[]), doc_obs[], sel)
                 if bbox !== nothing
                     handle = handle_at(selection_handles(bbox), x, y)
                     if handle !== nothing
+                        idxs = filter(i -> 1 <= i <= length(doc_obs[]), sel)
                         drag_mode[] = handle
-                        drag_art[] = doc_obs[][sel[1]]
+                        drag_sel[] = idxs
+                        drag_art[] = [doc_obs[][i] for i in idxs]
                         drag_bbox[] = bbox
                         drag_start[] = (x, y)
                         return nothing
@@ -569,12 +704,21 @@ function Workspace(; doc = Observable(ArtObject[]),
                 end
             end
             # 2. Click a shape: Shift adds it to (or removes it from) the
-            # multi-selection; a plain click selects just it; empty space
-            # clears the selection.
+            # multi-selection (the Shift has to be held right now — Rocks
+            # refreshes the mods at click time); a plain click selects just
+            # it; empty space starts a marquee with the cursor tool (or, for
+            # a click without drag, clears the selection).
             idx = hit_shape(matrix(view[]), doc_obs[], x, y,
                             8.0 / view[].scale)
             if idx === nothing
-                selection_obs[] = Int[]
+                if tool_obs[] === :mouse
+                    w = inv(matrix(view[])) * SVector(x, y, 1.0)
+                    drag_mode[] = :marquee
+                    drag_start[] = (w[1], w[2])
+                    marquee[] = (SVector(w[1], w[2]), SVector(w[1], w[2]))
+                else
+                    selection_obs[] = Int[]
+                end
             elseif Rocks.LAST_KEYMODS[] & 0x0003 != 0      # either Shift held
                 s = copy(sel)
                 if idx in s
@@ -595,6 +739,13 @@ function Workspace(; doc = Observable(ArtObject[]),
         on_move = (x, y) -> begin
             mode = drag_mode[]
             mode == :none && return nothing
+            if mode == :pan
+                # The grabbed camera follows the screen delta: dragging the
+                # moved world by as many pixels as the pointer moved.
+                view[] = pan(pan_cam[], x - drag_start[][1],
+                             y - drag_start[][2])
+                return nothing
+            end
             if mode == :rect
                 # The preview updates the observable → a re-render (and a
                 # redraw) on every motion event.
@@ -602,18 +753,28 @@ function Workspace(; doc = Observable(ArtObject[]),
                 rect_drag[] = (w[1], w[2])
                 return nothing
             end
-            sel = selection_obs[]
-            length(sel) != 1 && return nothing
-            sel = sel[1]
+            if mode == :marquee
+                # Same preview-per-motion as the rect drag.
+                w = inv(matrix(view[])) * SVector(x, y, 1.0)
+                marquee[] = (SVector(drag_start[][1], drag_start[][2]),
+                             SVector(w[1], w[2]))
+                return nothing
+            end
+            sel = drag_sel[]
+            arts = drag_art[]
+            (isempty(sel) || !isa(arts, AbstractVector)) && return nothing
             inv_m = inv(matrix(view[]))
             if mode == :translate
                 sw = inv_m * SVector(drag_start[][1], drag_start[][2], 1.0)
                 cw = inv_m * SVector(x, y, 1.0)
-                replace_art!(sel, translate(drag_art[], cw[1] - sw[1],
-                                            cw[2] - sw[2]))
+                replace_arts!(sel, [translate(a, cw[1] - sw[1],
+                                              cw[2] - sw[2]) for a in arts])
             elseif startswith(string(mode), "scale_")
-                # The dragged corner moves to the cursor; the opposite corner
-                # of the original bbox stays fixed.
+                # The dragged frame corner moves to the cursor; the opposite
+                # corner of the union bbox stays fixed — the whole group
+                # scales relative to it (each shape maps under the same
+                # similarity about the fixed corner, so the group and every
+                # member's bbox scale together).
                 i = parse(Int, string(mode)[7:end])
                 bbox = drag_bbox[]
                 corners = [(bbox[1], bbox[2]), (bbox[3], bbox[2]),
@@ -628,11 +789,13 @@ function Workspace(; doc = Observable(ArtObject[]),
                 sy = abs(cw0[2] - ow0[2]) < 1e-9 ? 1.0 :
                      (cw[2] - ow0[2]) / (cw0[2] - ow0[2])
                 (abs(sx) > 1e-6 && abs(sy) > 1e-6) || return nothing
-                replace_art!(sel, scale(drag_art[], sx, sy,
-                                        SVector(ow0[1], ow0[2])))
+                replace_arts!(sel, [scale(a, sx, sy,
+                                          SVector(ow0[1], ow0[2]))
+                                    for a in arts])
             elseif startswith(string(mode), "rotate_")
-                # Rotate around the selection's bbox center by the angle
-                # between the drag start and the cursor.
+                # Rotate the group around the union bbox centre by the angle
+                # between the drag start and the cursor (each shape turns
+                # under the same rotation about the combined centre).
                 bbox = drag_bbox[]
                 cc = inv_m * SVector((bbox[1] + bbox[3]) / 2,
                                      (bbox[2] + bbox[4]) / 2, 1.0)
@@ -640,16 +803,18 @@ function Workspace(; doc = Observable(ArtObject[]),
                 cw = inv_m * SVector(x, y, 1.0)
                 a0 = atan(sw[2] - cc[2], sw[1] - cc[1])
                 a1 = atan(cw[2] - cc[2], cw[1] - cc[1])
-                replace_art!(sel, rotate(drag_art[], a1 - a0,
-                                         SVector(cc[1], cc[2])))
+                replace_arts!(sel, [rotate(a, a1 - a0,
+                                           SVector(cc[1], cc[2]))
+                                    for a in arts])
             end
             return nothing
         end,
-        on_up = (_, _, _) -> begin
+        on_up = (x, y, button) -> begin
             # Rectangle tool: commit the drag as a new rectangle on the
             # active layer and select it (creation tools stay active, the
-            # mouse tool is switched back with its toolbar button).
-            if drag_mode[] == :rect
+            # mouse tool is switched back with its toolbar button). Only the
+            # left release ends a left press's drag.
+            if drag_mode[] == :rect && button == 1
                 (sx, sy) = drag_start[]
                 (ex, ey) = rect_drag[] !== nothing ? rect_drag[] : (sx, sy)
                 if abs(ex - sx) > 0.5 && abs(ey - sy) > 0.5    # ≥ 0.5 mm × 0.5 mm
@@ -661,16 +826,39 @@ function Workspace(; doc = Observable(ArtObject[]),
                 end
                 rect_drag[] = nothing
             end
-            drag_mode[] = :none
-            drag_art[] = nothing
+            # Cursor tool: commit the marquee. The drag's start corner
+            # decides the mode — started at a right corner (dragged
+            # leftward) everything overlapping the rect lands in the
+            # selection, started at a left corner only shapes fully inside
+            # it do. A click-shaped drag (never moved) clears the selection,
+            # like a plain click on empty space always did.
+            if drag_mode[] == :marquee && button == 1
+                (a, b) = marquee[] !== nothing ?
+                         marquee[] : (SVector(0.0, 0.0), SVector(0.0, 0.0))
+                marquee[] = nothing
+                if abs(b[1] - a[1]) > 0.5 || abs(b[2] - a[2]) > 0.5
+                    selection_obs[] = sort(shapes_in_rect(
+                        doc_obs[], (a, b),
+                        a[1] > b[1] ? :overlapping : :contained))
+                else
+                    selection_obs[] = Int[]
+                end
+            end
+            # A drag ends with the button that started it; a stray release of
+            # another button must not cut an ongoing drag short.
+            if button == 1 || (drag_mode[] == :pan && button == 2)
+                drag_mode[] = :none
+                pan_cam[] = Camera((0.0, 0.0), 0.0, 1.0)
+                drag_sel[] = Int[]
+                drag_art[] = nothing
+            end
             return nothing
         end,
         on_wheel = (dx, dy, x, y) -> (view[] = zoom_at(view[], x, y, 1.15^dy)),
         props...,
-        # Inside a Form's scroll column `flex` has no height to grow into:
-        # the caller passes `fill = true, height = "100%"` via `props` for
-        # the full client area. The open grab hand hovers here, the closed
-        # hand shows while pressed — a crosshair while a creation tool is
-        # active.
-        cursor = tool_obs[] === :rect ? :crosshair : :grab)
+        # The pointer keeps the plain arrow while hovering (the workspace is
+        # a surface, not a button — only grabbing changes the cursor): the
+        # gripping hand shows while the camera is grabbed, a crosshair while
+        # the rectangle tool drags.
+        cursor = drag_mode[] === :rect ? :crosshair : :pan)
 end

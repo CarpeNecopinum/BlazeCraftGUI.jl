@@ -4,6 +4,7 @@ import Rocks
 using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
                     translate, scale, rotate, hit_shape,
+                    selection_handles, selection_union_bbox, shapes_in_rect,
                     layer_color, ArtObject
 using BlazeCraft.Shapes: PolyLine, Point
 using StaticArrays: SVector
@@ -651,14 +652,35 @@ end
         Rocks.flush_dirty!()
         Rocks.run_effects!()
         @test tool[] == :mouse
-        # Shift+click on the first rectangle's top edge adds it.
-        Rocks.LAST_KEYMODS[] = 0x0001            # Shift held
+        # Shift+click on the first rectangle's top edge adds it. The mods
+        # ride on the click itself (dispatch refreshes them from SDL, so
+        # only a Shift held right now multi-selects).
         c1 = pt(SVector(150.0, 100.0))
-        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, c1...)
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          c1...; mod = 0x0001)
         Rocks.drain_events!()
         Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, c1...)
         Rocks.drain_events!()
-        Rocks.LAST_KEYMODS[] = 0x0000
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [1, 2]
+        # The Shift is long gone: a plain click must select just the
+        # clicked shape again (the stale-mods bug kept multi-selecting).
+        c2 = pt(SVector(40.0, 215.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, c2...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, c2...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [2]
+        # Shift+click the first rectangle again: back to the multi-selection
+        # for the delete step below.
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          c1...; mod = 0x0001)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, c1...)
+        Rocks.drain_events!()
         Rocks.flush_dirty!()
         Rocks.run_effects!()
         @test selection[] == [1, 2]
@@ -742,5 +764,404 @@ end
         @test Bool(get(editor.props, :fit_content, false))
         # The workspace split is exactly as tall as before (no squish).
         @test Rocks.find_kind(main, Rocks.Split).rect[4] == split_h
+    end
+end
+
+@testset "camera pan with the middle button" begin
+    # The camera moves with a middle-button drag (a gripping hand while
+    # grabbed); hovering keeps the plain arrow, and left/right clicks stay
+    # selection-only.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    processes = Observable(Dict{Int,Process}())
+    tool = Observable(:mouse)
+    active_layer = Observable(0)
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              processes = processes, tool = tool,
+                              active_layer = active_layer)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)             # fit the (empty) view
+
+        # Hovering the workspace must not change the cursor: the surface
+        # asks for the plain arrow (`:pan` — only grabbing changes it).
+        area = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Pressable &&
+                haskey(f.props, :on_wheel) && haskey(f.props, :on_down) &&
+                haskey(f.props, :on_move)
+        end
+        @test area !== nothing
+        @test get(area.props, :cursor, nothing) === :pan
+
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        @test canvas !== nothing
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        pt(p) = begin
+            s = apply(matrix(cam), p)
+            (round(Int, canvas.rect[1] + s[1]),
+             round(Int, canvas.rect[2] + s[2]))
+        end
+
+        # Draw a rectangle with the creation tool (left drag; the active
+        # view was fit to the empty document, so `pt` keeps matching).
+        rect_btn = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Pressable &&
+                any(k -> get(k.props, :icon, nothing) ==
+                            BlazeCraftGUI.MDI_GLYPHS["rectangle"],
+                    Rocks.fibers(f))
+        end
+        @test rect_btn !== nothing
+        Rocks.click!(rect_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :rect
+        a, b = pt(SVector(100.0, 100.0)), pt(SVector(200.0, 160.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, a...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_MOTION, b...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 1
+        @test selection[] == [1]
+
+        # The drag ends with the button that started it: a stray
+        # right-button press/release during the left drag must not cut the
+        # rectangle creation short.
+        @test tool[] == :rect                # creation tools stay active
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        a, b = pt(SVector(110.0, 110.0)), pt(SVector(210.0, 170.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, a...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_MOTION, b...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, b...;
+                          button = 3)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b...;
+                          button = 3)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, b...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 2             # the rect still committed
+
+        # Switch back to the select tool (creation tools stay active).
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        select_btn = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Pressable &&
+                any(k -> get(k.props, :icon, nothing) ==
+                            BlazeCraftGUI.MDI_GLYPHS["select"],
+                    Rocks.fibers(f))
+        end
+        @test select_btn !== nothing
+        Rocks.click!(select_btn)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test tool[] == :mouse
+
+        # A middle press is a grab, not a click: grab the camera over
+        # empty space and drag it 120 px right, 90 px down — nothing is
+        # selected and nothing is edited.
+        pan0 = pt(SVector(250.0, 100.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          pan0...; button = 2)
+        Rocks.drain_events!()
+        Rocks.push_motion!(canvas, pan0[1] + 120, pan0[2] + 90)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                          pan0[1] + 120, pan0[2] + 90; button = 2)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 2             # panning never edits
+        @test selection[] == [2]             # ...and never selects/clears
+
+        # The shapes moved with the camera by exactly the drag distance:
+        # the screen spot of world (210, 140) — on the second rectangle's
+        # right edge — now selects it.
+        spot = pt(SVector(210.0, 140.0))
+        moved = (spot[1] + 120, spot[2] + 90)
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, moved...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, moved...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [2]
+
+        # The former screen spot of the same world point now misses (the
+        # world point under it moved with the camera).
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, spot...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, spot...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == Int[]
+
+        # Drag the camera back: the original screen spot selects again.
+        pan0 = pt(SVector(250.0, 100.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          pan0...; button = 2)
+        Rocks.drain_events!()
+        Rocks.push_motion!(canvas, pan0[1] - 120, pan0[2] - 90)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                          pan0[1] - 120, pan0[2] - 90; button = 2)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, spot...)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, spot...)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [2]
+
+        # A right press is no action: it must not clear the selection.
+        blank = pt(SVector(250.0, 100.0))
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                          blank...; button = 3)
+        Rocks.drain_events!()
+        Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                          blank...; button = 3)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [2]
+    end
+end
+
+# Marquee selection with the cursor tool: the drag on empty space selects
+# what it covers — green (started at a right corner, overlap) or red
+# (started at a left corner, fully contained); a click-shaped drag clears.
+@testset "marquee selection with the cursor tool" begin
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    processes = Observable(Dict{Int,Process}())
+    tool = Observable(:mouse)
+    active_layer = Observable(0)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = [ArtObject("a", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+             ArtObject("b", [ring(40.0, 190.0, 140.0, 240.0)], 2)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              processes = processes, tool = tool,
+                              active_layer = active_layer)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)             # fit the refit to the now-only doc
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        pt(p) = begin
+            s = apply(matrix(cam), p)
+            (canvas.rect[1] + s[1], canvas.rect[2] + s[2])
+        end
+        drag(pt_from, pt_to) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(pt_from[1]), Float32(pt_from[2]))
+            Rocks.drain_events!()
+            Rocks.push_motion!(canvas, pt_to[1], pt_to[2])
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(pt_to[1]), Float32(pt_to[2]))
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+
+        # No tool needed: the cursor tool is the default and the marquee
+        # starts on empty space. Green marquee (dragged leftward, from the
+        # bottom-right of its rect): selects everything overlapping — both.
+        drag(pt(SVector(250.0, 260.0)), pt(SVector(60.0, 60.0)))
+        @test selection[] == [1, 2]
+
+        # Red marquee (dragged rightward, from the top-left): only shapes
+        # entirely inside — the second rectangle, but not the clipped first.
+        drag(pt(SVector(30.0, 180.0)), pt(SVector(170.0, 270.0)))
+        @test selection[] == [2]
+
+        # Red marquee over a part of both: nobody is fully inside, the
+        # selection empties.
+        drag(pt(SVector(90.0, 90.0)), pt(SVector(175.0, 175.0)))
+        @test isempty(selection[])
+
+        # A click without a drag (the hairline rect) clears, like any click
+        # on empty space.
+        selection[] = [1, 2]
+        drag(pt(SVector(250.0, 260.0)), pt(SVector(250.0, 260.0)))
+        @test isempty(selection[])
+        drag(pt(SVector(250.0, 260.0)), pt(SVector(60.0, 60.0)))
+        @test selection[] == [1, 2]          # re-set for the group frame test
+    end
+end
+
+# The selection frame encloses the union of all selected shapes and its
+# handles transform the group relative to the combined centre of bounds.
+@testset "group selection frame and transforms" begin
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    processes = Observable(Dict{Int,Process}())
+    tool = Observable(:mouse)
+    active_layer = Observable(0)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = [ArtObject("a", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+             ArtObject("b", [ring(40.0, 190.0, 140.0, 240.0)], 2)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              processes = processes, tool = tool,
+                              active_layer = active_layer)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        m = matrix(cam)
+        pt(p) = begin
+            s = apply(m, p)
+            (canvas.rect[1] + s[1], canvas.rect[2] + s[2])
+        end
+        # Window-absolute screen px → world mm (handle positions are
+        # canvas-local px; pushes need window coords).
+        to_world(s) = begin
+            w = inv(m) * SVector(s[1] - canvas.rect[1], s[2] - canvas.rect[2], 1.0)
+            SVector(w[1], w[2])
+        end
+        scr(h) = (canvas.rect[1] + h[1], canvas.rect[2] + h[2])
+        press_drag(press_at, move_to) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(press_at[1]), Float32(press_at[2]))
+            Rocks.drain_events!()
+            Rocks.push_motion!(canvas, move_to[1], move_to[2])
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(move_to[1]), Float32(move_to[2]))
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+
+        # Select both with a green marquee.
+        press_drag(pt(SVector(250.0, 260.0)), pt(SVector(60.0, 60.0)))
+        @test selection[] == [1, 2]
+
+        handles = selection_handles(
+            selection_union_bbox(m, doc[], selection[]))
+        # The frame centre sits over the union's world centre.
+        centre = to_world(scr(handles.center))
+        @test isapprox(centre[1], (40.0 + 200.0) / 2; atol = 0.5)
+        @test isapprox(centre[2], (100.0 + 240.0) / 2; atol = 0.5)
+
+        # Translate the group by its center handle: every selected shape
+        # carries the same world delta, so relative positions survive.
+        c = scr(handles.center)
+        press_drag(c, (c[1] + 30, c[2] + 15))
+        @test selection[] == [1, 2]          # the drag keeps the selection
+        world_dx = (to_world((c[1] + 30, c[2] + 15)) - to_world(c))[1]
+        world_dy = (to_world((c[1] + 30, c[2] + 15)) - to_world(c))[2]
+        b1 = document_bounds(doc[])
+        @test isapprox(b1[1][1], 40.0 + world_dx; atol = 0.6)
+        @test isapprox(b1[2][1], 200.0 + world_dx; atol = 0.6)
+        @test isapprox(b1[2][2], 240.0 + world_dy; atol = 0.6)
+        # Relative positions survive: the two shapes keep their offset.
+        off_x = document_bounds([doc[][2]])[1][1] -
+                document_bounds([doc[][1]])[1][1]
+        @test isapprox(off_x, 40.0 - 100.0; atol = 0.3)
+
+        # Scale the group: corner 3 (bottom right of the union) drags, the
+        # opposite union corner stays fixed, and both shapes scale about it
+        # (so the group and each member shrink/grow by the same factors).
+        ub = selection_union_bbox(m, doc[], selection[])
+        handles = selection_handles(ub)
+        p0 = scr(handles.corners[1])         # the fixed opposite corner
+        p3 = scr(handles.corners[3])         # the dragged corner
+        fixed = to_world(p0)
+        cw0 = to_world(p3)
+        cw1 = to_world((p3[1] + 60, p3[2] + 30))
+        sx = (cw1[1] - fixed[1]) / (cw0[1] - fixed[1])
+        sy = (cw1[2] - fixed[2]) / (cw0[2] - fixed[2])
+        pre = document_bounds(doc[])
+        press_drag(p3, (p3[1] + 60, p3[2] + 30))
+        @test selection[] == [1, 2]                # the drag keeps the selection
+        post = document_bounds(doc[])
+        @test isapprox(post[1][1], fixed[1] + sx * (pre[1][1] - fixed[1]);
+                       atol = 0.6)
+        @test isapprox(post[2][1], fixed[1] + sx * (pre[2][1] - fixed[1]);
+                       atol = 0.6)
+        @test isapprox(post[1][2], fixed[2] + sy * (pre[1][2] - fixed[2]);
+                       atol = 0.6)
+        @test isapprox(post[2][2], fixed[2] + sy * (pre[2][2] - fixed[2]);
+                       atol = 0.6)
+    end
+end
+
+# Layout: the layer palette left the app's status bar — it is a strip
+# directly below the workspace, as wide as the canvas, with the document
+# summary staying alone on the window's bottom edge.
+@testset "layer bar sits below the workspace" begin
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    processes = Observable(Dict{Int,Process}())
+    tool = Observable(:mouse)
+    active_layer = Observable(0)
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              processes = processes, tool = tool,
+                              active_layer = active_layer)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        @test canvas !== nothing
+
+        # The palette chips: every 16×16 pressable of the status-bar style.
+        chips = [f for f in Rocks.fibers(main)
+                 if f.kind === Rocks.Pressable &&
+                 get(f.props, :width, 0) == 16 && get(f.props, :height, 0) == 16
+                 && haskey(f.props, :on_press)]
+        @test length(chips) == CUT_LAYERS + 2      # palette 00–29 + T1/T2
+        cx0 = minimum(f.rect[1] for f in chips)
+        cx1 = maximum(f.rect[1] + f.rect[3] for f in chips)
+        cy0 = minimum(f.rect[2] for f in chips)
+        cy1 = maximum(f.rect[2] + f.rect[4] for f in chips)
+        # The strip sits between the canvas bottom and the document summary.
+        status_text = Rocks.find_fiber(main) do f
+            f.kind === Rocks.Text &&
+                any(s -> s isa AbstractString &&
+                          occursin("no design imported", s),
+                    get(f.props, :children, ()))
+        end
+        @test status_text !== nothing
+        # The strip sits between the canvas bottom and the document summary.
+        @test cy0 >= canvas.rect[2] + canvas.rect[4]
+        @test cy1 <= status_text.rect[2]
+        # ...and spans the canvas horizontally (not the whole window — the
+        # status bar region's summary stays separate).
+        @test cx0 >= canvas.rect[1] - 2
+        @test cx1 <= canvas.rect[1] + canvas.rect[3] + 2
     end
 end

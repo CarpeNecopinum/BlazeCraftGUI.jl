@@ -732,7 +732,7 @@ Phase 0/1 start of the roadmap (`09-implementation-roadmap.md`): the app shell +
 | `src/camera.jl` | `Camera(translation, rotation, scale)` — StaticArrays `SVector`/`SMatrix`; `matrix(cam)` builds the 3×3 affine (translate ∘ rotate ∘ scale with the baked-in y-flip), `apply(m, p)`, `zoom_at` (unprojects the cursor through `inv(matrix)` so the world point under it stays fixed), `pan` |
 | `src/workspace.jl` | the `Workspace` component: `MouseArea(Canvas)` with pan, wheel-zoom, **selection** (clicking a shape's line selects it — `hit_shape` point-to-segment distance in world mm), the marching-dash selection outline (`draw_dashed_polyline`, phase-advanced by a 100 ms `useInterval`), the dashed bounding box and the transform handles (corner squares scale about the opposite corner, the center square translates, the outside rotation handles rotate about the bbox center); the world-space geometry (bed corners + grid segments) is constant and transformed per frame through the camera matrix; `fit_camera` fits the union of the 300×300 mm work area and the document |
 | `src/filedialog.jl` | `show_open_file_dialog!` — SDL3's native OS dialog (async: the callback only fills an Observable; the main thread consumes it during the next render, where the import runs) |
-| `src/app.jl` | `E.Form` shell: menu bar, the **Position toolbar** (the 3×3 origin grid, X/Y position and W/H size spinners via `E.Spinner`, the aspect lock), `DocStatus` status bar, Workspace + error MessageBox; app-level `doc`/`selection`/`origin`/`lock` Observables (may be passed in by tests) |
+| `src/app.jl` | `E.Form` shell: menu bar, the **Position toolbar** (the 3×3 origin grid, X/Y position and W/H size spinners via `E.Spinner`, the aspect lock), `DocStatus` status bar, the Workspace with the **LayerBar strip below the canvas** (§8.14), the Cuts/Layers panel and error MessageBox; app-level `doc`/`selection`/`origin`/`lock` Observables (may be passed in by tests) |
 | `examples/blazecraft.jl` | entry point; `ROCKS_SCREENSHOT=… SDL_VIDEO_DRIVER=dummy …` headless runs |
 | `test/runtests.jl` | unit tests (import, bounds, palette, summary, camera matrix/zoom_at/pan, `fit_camera`) — 34/34 |
 | **SDL3.jl** (`~/Development/SDL3.jl`) | **new `src/dialog.jl`**: the SDL_dialog.h wrapping — `SDL_DialogFileFilter`, `ShowOpenFileDialog`/`ShowSaveFileDialog`/`ShowOpenFolderDialog`/`ShowFileDialogWithProperties` (892/896 tests pass, 4 broken pre-existing). BlazeCraftGUI's `[sources]` points SDL3 at the local checkout. |
@@ -1130,12 +1130,10 @@ is a square `input_height` button whose icon shows the actual state: **`lock`** 
 selection-blue background) while scaling is uniform, **`lock-open`** (open shackle) when not.
 
 **Selection is a vector** (`Observable{Vector{Int}}`, sorted): a plain click selects one shape,
-**Shift+click** (either Shift — `LAST_KEYMODS[] & 0x0003`) toggles a shape in/out of the
-multi-selection, empty space clears. Every selected shape draws its marching-dash outline and dashed
-bbox; **transform handles only appear for a single selection** (per-shape transform for multi comes
-later). Consumers updated: PositionToolbar (spinners sync/act on a single selection only, disabled
-otherwise), LayerBar (`set_layer!` recolours *all* selected shapes), and the rect tool's commit path
-(selects the new shape).
+**Shift+click** (either Shift) toggles a shape in/out of the multi-selection, empty space starts a
+**marquee** with the cursor tool (§8.14). Consumers updated: PositionToolbar (spinners sync/act on a
+single selection only, disabled otherwise), LayerBar (`set_layer!` recolours *all* selected shapes),
+and the rect tool's commit path (selects the new shape).
 
 **Layer chips light up**: a chip carries the selection-colour border when it is the active colour *or*
 its layer holds any selected shape — a multi-selection spanning layers lights them all.
@@ -1168,3 +1166,71 @@ first (Rocks consumes it before fields see it).
 46. **Direct (non-`@rock`) component calls are keyword-only** — `Mechanics.Button(element; props...)`
     is a `MethodError`; wrap the call in `@rock` (children after `;`) or pass `children =
     Any[...]` explicitly.
+
+### 8.14 Panning, click-time mods, group frame, marquee, layer-bar move (2026-10-30)
+
+**Camera pan** (middle-button drag): the Workspace's `on_down` starts a `:pan` mode on **button 2**
+(storing the pressed camera and the screen anchor), `on_move` re-sets the camera via `pan(cam, dx, dy)`
+(screen delta, grab-the-world feel), `on_up` ends it with the button that started it (a stray other
+button's release must not cut a drag short — the rect commit is likewise gated to the left release).
+Rocks gained two semantics for it:
+
+- **`cursor = :pan`** — the plain arrow while hovering (no pointing hand: the workspace is a surface,
+  not a button) and the **closed grabbing hand while a non-left button is held**. `update_cursor`
+  decides from `ACTIVE_PRESS` per button: `:grab` grabs with any button (open hand on hover as
+  before), `:pan` grabs only with a non-left press, `:crosshair` (newly real — it was never
+  implemented) shows during creation-tool drags; hovered `:text`/`:grab`/`:crosshair` keep their
+  pointers, `:pan`/`:arrow` (new) keep the plain arrow.
+- **Press-captured motion for any button** — mouse-motion dispatch used to feed `on_move`/`on_drag`
+  only when the *left* button's press was active, so a middle-button drag stopped tracking outside
+  the area (or never got moves inside it via the hover path). It now feeds every pressed fiber of
+  the window (left behaviour unchanged).
+
+**Click-time keymods**: `LAST_KEYMODS` was only refreshed on `SDL_EVENT_KEY_DOWN`, so a Shift that
+was pressed and released long before kept multi-selecting every subsequent click. Rocks now
+refreshes `LAST_KEYMODS[] = SDL3.GetModState()` on every **mouse-button-down** dispatch (and on
+`KEY_UP`, replacing the stale keydown value) — a click sees the modifiers held *right now*. The
+headless driver keeps SDL's state in sync: `push_key!(…; mod)` and the new `push_mouse!(…; mod)`
+call `SDL_SetModState`, so tests carry click mods on the event (`push_mouse!(canvas, DOWN, x, y;
+mod = 0x0001)`), never by poking `LAST_KEYMODS`.
+
+**One selection frame around the union** (`selection_union_bbox`): every selection draws one dashed
+frame + transform handles enclosing the *union of all selected shapes* (a single shape is its own
+bbox as before). The drag state became group state: `drag_sel` (indices) + `drag_art` (the original
+arts) with `replace_arts!` writing **one document copy per move event**. Translate moves the delta to
+every shape; scaling maps every shape under the same similarity about the union's fixed opposite
+corner; rotation turns every shape about the union centre — so the group and each member transform
+together and relative positions survive.
+
+**Marquee selection** (cursor tool): a left press on empty space starts a drag; the *horizontal*
+direction decides the mode — started at a right corner (dragged leftward) the dashed rect draws
+**green** and selects everything **overlapping**, started at a left corner it draws **red** and
+selects only shapes **fully contained** (`shapes_in_rect` on the shapes' world bboxes). A
+click-shaped drag (never moved ≥ 0.5 mm) clears the selection like any empty-space click.
+
+**Selection boxes snap to pixel corners**: SDL's line raster spills into the neighbouring row/column
+when endpoints sit between or on pixel centres — first seen as width-2 lines that followed exact
+mouse movement (sub-pixel endpoints), then as *always* 2 px once the frame was rounded to whole
+pixels (integer endpoints look the same on the GPU renderer). `selection_union_bbox` and the
+marquee now land endpoints on pixel corners (`snap_px = floor(p) + 0.5`), which keeps orthogonal
+1 px lines; the snapping touches render pixels only, never the world-space interaction math
+(document geometry keeps float precision).
+
+![Group selection: union frame with handles, marquee multi-selection, layer bar below the workspace](analysis/images/screenshots/blazecraft-group-selection.png)
+
+**Layer bar relocated**: the palette left the Form's status row — it is now a strip **directly below
+the workspace** (inside the split's left pane: `Column(Workspace(flex = 1, fill); LayerBar(fill))`),
+exactly as wide as the canvas, while the doc summary stays alone on the window's bottom edge.
+
+**Gotchas**:
+
+47. **Click mods live on the event, not the check** — with `dispatch_event!` refreshing
+    `LAST_KEYMODS` from the SDL state at button-down (the point of the fix), a test that sets
+    `Rocks.LAST_KEYMODS[]` directly is clobbered by the very next dispatch. Synthetic input carries
+    mods via `push_mouse!(…; mod)` / `push_key!(…; mod)` (both keep `SDL_SetModState` in sync).
+48. **Frame/handle coordinates are canvas-local px; pushes are window-absolute** —
+    `selection_union_bbox`/`selection_handles` output (and the draw's rect coordinates) are
+    canvas-local; feeding them to `push_mouse!` as-is lands the click offset by the canvas origin
+    (the press silently missed the handle and fell through to a marquee). Offset by
+    `canvas.rect[1..2]` on the way in, subtract the same on the way out (`scr`/`to_world` helpers in
+    the test; gotcha 38's stale-rect rule applies equally to these re-reads).

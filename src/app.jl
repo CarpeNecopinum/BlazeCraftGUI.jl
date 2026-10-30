@@ -547,20 +547,24 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
         end,
         toolbar = (@rock PositionToolbar(doc = doc, selection = selection,
                                          origin = origin, lock = lock)),
-        status = (@rock Row(DocStatus(doc = doc), (@rock Box(; flex = 1)),
-                            LayerBar(doc = doc, selection = selection,
-                                     active_layer = active_layer);
+        status = (@rock Row(DocStatus(doc = doc), (@rock Box(; flex = 1));
                             gap = 6, align = :center)),
         children = Any[
             (@rock Row(
                 (@rock ToolsPanel(tool = tool; fill = true)),
                 (@rock Split(
-                    (@rock Box(
+                    (@rock Column(
                         (@rock Workspace(doc = doc, selection = selection,
                                          processes = processes, tool = tool,
                                          active_layer = active_layer;
-                                         fill = true, height = "100%"));
-                        fill = true)),
+                                         flex = 1, fill = true)),
+                        # The layer palette sits as a strip directly below
+                        # the workspace — same width as the canvas, outside
+                        # the app's status bar.
+                        (@rock LayerBar(doc = doc, selection = selection,
+                                        active_layer = active_layer;
+                                        fill = true));
+                        fill = true));
                     (@rock Box(
                         (@rock CutsLayersPanel(doc = doc, processes = processes,
                                                editor_open = editor_open,
