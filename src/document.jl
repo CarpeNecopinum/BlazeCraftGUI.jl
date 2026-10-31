@@ -157,17 +157,34 @@ end
 """
     parent_group(doc, idx) -> Union{Int,Nothing}
 
-The index of the *innermost* group holding entry `idx` directly (its id in
-the group's children), or `nothing` for a top-level entry. Clicking a shape
-selects this group per "selecting one shape selects the whole group".
+The index of the *outermost* group in entry `idx`'s ancestor chain (the
+group no other group of the document holds), or `nothing` for a top-level
+entry. Clicking a shape selects this group — "selecting one shape of a
+group selects the whole group" resolves to the outermost level, which is
+also what makes a group act like a single shape for the marquee units.
 """
 function parent_group(doc::AbstractVector{ArtObject}, idx::Int)
     (1 <= idx <= length(doc)) || return nothing
+    holder = nothing
     gid = doc[idx].id
-    for (i, a) in enumerate(doc)
-        is_group(a) && gid in a.children && return i
+    for a in doc
+        is_group(a) && gid in a.children && (holder = a; break)
     end
-    return nothing
+    holder === nothing && return nothing
+    # Walk up the ancestor chain to the outermost group (a seen guard so a
+    # hand-built cyclic document cannot spin).
+    seen = Set{UInt}([holder.id])
+    while true
+        next = nothing
+        for a in doc
+            is_group(a) && !(a.id in seen) &&
+                holder.id in a.children && (next = a; break)
+        end
+        next === nothing && break
+        holder = next
+        push!(seen, holder.id)
+    end
+    return art_index(doc, holder.id)
 end
 
 """

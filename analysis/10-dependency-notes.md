@@ -730,7 +730,7 @@ Phase 0/1 start of the roadmap (`09-implementation-roadmap.md`): the app shell +
 | `src/BlazeCraftGUI.jl` | module; re-exports `App`, `ArtObject`, `import_art`, `run_gui`, `FileDialogResult`, `show_open_file_dialog!`; `run_gui(; kw…) = render(App; kw…)` |
 | `src/document.jl` | `ArtObject` (one document entry: unique `id`, `kind` `:shape`/`:group`, name, flattened `PolyLine`s, layer color, group `children` ids), `import_art(path)` (SVG via `BlazeCraft.Importers.load_svg`, DXF via `load_dxf_instructions` + `extract_polys`, merged+`flatten`ed once at import), `center_on_workarea`, `document_bounds`, the group helpers (`is_group`, `art_index`, `child_indices`, `leaves_of`, `resolve_leaves`, `parent_group`, `top_level_indices`, `art_bounds`, `group_arts`/`ungroup_arts`/`delete_arts`, §8.15), `layer_color` (LightBurn palette `00`=black, `01`=blue, `02`=red…), `WORK_AREA_MM` |
 | `src/camera.jl` | `Camera(translation, rotation, scale)` — StaticArrays `SVector`/`SMatrix`; `matrix(cam)` builds the 3×3 affine (translate ∘ rotate ∘ scale with the baked-in y-flip), `apply(m, p)`, `zoom_at` (unprojects the cursor through `inv(matrix)` so the world point under it stays fixed), `pan` |
-| `src/workspace.jl` | the `Workspace` component: `MouseArea(Canvas)` with pan, wheel-zoom, **selection** (clicking a shape's line selects *its group* — `hit_shape` point-to-segment distance in world mm, the click unit mapped through `parent_group`; Shift toggles at unit level), group-aware marquee (`shapes_in_rect` on the top-level entries: a group acts like a single shape), the marching-dash selection outline (`draw_dashed_polyline`, phase-advanced by a 100 ms `useInterval`, resolved through `resolve_leaves`), the dashed union bounding box and the transform handles (corner squares scale about the opposite corner, the center square translates, the outside rotation handles rotate about the bbox center), the right-click `ctx_open` flip (§8.15); the world-space geometry (bed corners + grid segments) is constant and transformed per frame through the camera matrix; `fit_camera` fits the union of the 300×300 mm work area and the document |
+| `src/workspace.jl` | the `Workspace` component: `MouseArea(Canvas)` with pan, wheel-zoom, **selection** (clicking a shape's line selects *its group* — `hit_shape` point-to-segment distance in world mm, the click unit mapped through `parent_group`; Shift toggles at unit level), group-aware marquee (`shapes_in_rect` on the top-level entries: a group acts like a single shape), the marching-dash selection outline in each shape's **layer colour** (a selected shape keeps its own colour — `draw_dashed_polyline`, phase-advanced by a 100 ms `useInterval`, resolved through `resolve_leaves`), the dashed union bounding box and the transform handles (corner squares scale about the opposite corner, the center square translates, the outside rotation handles rotate about the bbox center), the right-click `ctx_open` flip (§8.15); the world-space geometry (bed corners + grid segments) is constant and transformed per frame through the camera matrix; `fit_camera` fits the union of the 300×300 mm work area and the document |
 | `src/filedialog.jl` | `show_open_file_dialog!` — SDL3's native OS dialog (async: the callback only fills an Observable; the main thread consumes it during the next render, where the import runs) |
 | `src/app.jl` | `E.Form` shell: menu bar, the **Position toolbar** (the 3×3 origin grid, X/Y position and W/H size spinners via `E.Spinner`, the aspect lock — spinners resolve groups to their subtree union), `DocStatus` status bar, the Workspace with the **LayerBar strip below the canvas** (§8.14), the right dock as a **TabControl** ("Cuts / Layers" page + "Outline" page, §8.15), `WorkspaceContextMenu` (Group/Ungroup over the selection) and the error MessageBox; app-level `doc`/`selection`/`origin`/`lock`/`panel_tab`/`ctx_open` Observables (may be passed in by tests) |
 | `src/outline.jl` | `OutlinePanel` (§8.15): the document outline — an indented tree of every entry with members under their group (shapes a layer-coloured square, groups an outlined box mark); a row click selects exactly that entry; rows scroll in a `ScrollView` |
@@ -1251,8 +1251,9 @@ what makes the hierarchy survive every index-shuffling edit.
 Derived helpers, all in `document.jl`: `is_group`, `art_index(doc, id)`, `child_indices`,
 `leaves_of(doc, idx)` (a group's outlines *are* its leaves' outlines), `resolve_leaves(doc,
 selection)` (the "what geometry does my selection own" helper every consumer goes through),
-`parent_group` (the *direct* holder — "selecting one shape selects the whole group" means the
-innermost group holding it), `top_level_indices` (the marquee's selection units),
+`parent_group` (the *outermost* group in the entry's ancestor chain — "selecting one shape selects
+the whole group" resolves to the outermost level, which is also what makes the click unit and the
+marquee's top-level units agree), `top_level_indices` (the marquee's selection units),
 `art_bounds(doc, idx)` (a group's bbox = the union over its subtree — what makes a group act like a
 single shape), `group_arts` / `ungroup_arts` / `delete_arts`. Ungrouping dissolves **one level**:
 the members take the group's place — in the parent group's children when nested (LightBurn's
@@ -1260,8 +1261,9 @@ ungroup promotes into the parent), at the top level otherwise. Deleting a shape 
 group's `children`; deleting a group node dissolves it.
 
 **Group-aware selection and marquee** (`src/workspace.jl`): a canvas click maps the hit leaf
-through `parent_group` — the click unit is the innermost group holding the shape (the shape itself
-when top level); Shift toggles at unit level. The marquee (`shapes_in_rect`) now compares the
+through `parent_group` — the click unit is the *outermost* group in the shape's ancestor chain (the
+shape itself when top level), matching the marquee's top-level units; Shift toggles at unit level
+in the workspace. The marquee (`shapes_in_rect`) now compares the
 *top-level entries* against the rect — a group acts like a single shape: green (overlap) joins the
 whole unit via its combined bounds, red (containment) needs the whole unit inside; a partially
 covered group falls out entirely either way. `selection_union_bbox` and the marching dashes
@@ -1287,9 +1289,10 @@ new `OutlinePanel` are pages of an `E.TabControl` (`tabs = ["Cuts / Layers", "Ou
 = an injectable Observable). The outline is an indented tree of every entry with members indented
 under their group (shapes carry a square in their layer colour, groups an outlined box mark); the
 tree is virtual — it reads the flat document and walks `child_indices`, so it needs no state. A
-row click selects **exactly** that entry: a shape row selects only the shape (never a parent
-group), a group row selects the group (its members follow by membership). Rows live in a
-`ScrollView` so long documents scroll.
+plain row click selects **exactly** that entry: a shape row selects only the shape (never a parent
+group), a group row selects the group (its members follow by membership); Ctrl/Shift+click toggles
+the row's entry into the multi-selection instead (the mods ride on the click — Rocks refreshes
+them at click time). Rows live in a `ScrollView` so long documents scroll.
 
 ![Outline tab: nested groups, indented members, exact-entry selection](analysis/images/screenshots/blazecraft-outline.png)
 

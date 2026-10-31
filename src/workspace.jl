@@ -372,7 +372,9 @@ end
 
 Draw one frame: the 300×300 mm work area (filled bed, border), the 10 mm grid
 with thicker 100 mm majors, the document's outlines (one stroke color per
-layer), the selected shapes' marching-dash outlines — and **one** selection
+layer), the selected shapes' marching-dash outlines in their **layer
+colour** (a selected shape keeps its own colour; the dashes trace it at
+double width) — and **one** selection
 frame with transform handles that encloses the *union* of the selection (a
 single selected shape gets its own bbox; several shapes share the frame
 around them all, and each operation applies relative to the combined centre
@@ -443,7 +445,9 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                 # Each curve starts at its own position in the dash pattern
                 # (spread by the golden-ratio modulus, stable across frames),
                 # so short curves don't all flash in sync as the phase moves.
-                draw_dashed_polyline(ctx, pts; color = (0.15, 0.35, 0.9),
+                # Selected shapes keep their layer colour (§4: colour =
+                # layer) — the marching dashes trace it at double width.
+                draw_dashed_polyline(ctx, pts; color = layer_color(obj.layer),
                                      width = 2.0,
                                      phase = dash_phase + mod(path_index * 2.399963, 10.0),
                                      closed = pl.closed)
@@ -550,10 +554,11 @@ end
 The interactive workspace. `doc` is an `Observable{Vector{ArtObject}}` owned
 by the app and `selection` an `Observable{Vector{Int}}` (the selected
 entries' indices — shapes and/or groups). A left click on a shape selects
-**its group** (the innermost group holding it — "selecting one shape of a
-group selects the whole group"; a top-level shape selects just itself),
-Shift adds/removes of the multi-selection at unit level (the Shift has to
-be held *while* clicking). Empty space starts a **marquee**: dragging
+**its group** (the *outermost* group in the shape's ancestor chain —
+"selecting one shape of a group selects the whole group"; a top-level shape
+selects just itself), Shift/Ctrl adds/removes of the multi-selection at unit
+level (the mods have to be held *while* clicking). Empty space starts a
+**marquee**: dragging
 rightward (from a left corner) draws the red containment marquee, dragging
 leftward (from a right corner) the green overlap marquee — selection units
 are the top-level entries, so a group acts like a single shape either way
@@ -734,11 +739,11 @@ function Workspace(; doc = Observable(ArtObject[]),
                     end
                 end
             end
-            # 2. Click a shape: Shift adds it to (or removes it from) the
-            # multi-selection (the Shift has to be held right now — Rocks
-            # refreshes the mods at click time); a plain click selects just
-            # it; empty space starts a marquee with the cursor tool (or, for
-            # a click without drag, clears the selection).
+            # 2. Click a shape: Shift/Ctrl adds its unit to (or removes it
+            # from) the multi-selection (the mods have to be held right now
+            # — Rocks refreshes them at click time); a plain click selects
+            # just the unit; empty space starts a marquee with the cursor
+            # tool (or, for a click without drag, clears the selection).
             idx = hit_shape(matrix(view[]), doc_obs[], x, y,
                             8.0 / view[].scale)
             if idx === nothing
@@ -752,10 +757,10 @@ function Workspace(; doc = Observable(ArtObject[]),
                 end
             else
                 # Selecting one shape of a group selects the whole group:
-                # the click unit is the innermost group holding the hit
-                # shape (the shape itself when it is top level). Shift
-                # toggles at the unit level too (the Shift must be held
-                # right now — Rocks refreshes the mods at click time).
+                # the click unit is the *outermost* group in the shape's
+                # ancestor chain (the shape itself when it is top level).
+                # Shift/Ctrl toggles at the unit level too (the mods must be
+                # held right now — Rocks refreshes them at click time).
                 g = parent_group(doc_obs[], idx)
                 unit = g === nothing ? idx : g
                 if Rocks.LAST_KEYMODS[] & 0x0003 != 0      # either Shift held

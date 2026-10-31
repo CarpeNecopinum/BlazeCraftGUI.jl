@@ -4,11 +4,12 @@
 # the flat document and walks `child_indices` — so the hierachy needs no
 # state of its own.
 #
-# Outline-click selection is *exact*: a row selects precisely that doc
-# entry without riding up (a shape selects only the shape, never its
-# parent group) and without riding down in the doc sense (a group row
+# Outline-click selection is *exact* by default: a row selects precisely
+# that doc entry without riding up (a shape selects only the shape, never
+# its parent group) and without riding down in the doc sense (a group row
 # selects the group node — its members come along by membership, which is
-# what a group selection means everywhere else too).
+# what a group selection means everywhere else too). Ctrl/Shift+click
+# toggles the row's entry into the multi-selection instead.
 """
     OutlinePanel(; doc, selection, fill = false)
 
@@ -16,7 +17,9 @@ The document outline: an indented tree of every shape and (nested) group.
 Groups show an outlined box mark, shapes a square in their layer colour.
 Clicking a row selects *exactly* that document entry — a shape row
 selects only that shape (a parent group stays unselected), a group row
-selects the group (its members follow by membership). The row of the
+selects the group (its members follow by membership). Ctrl/Shift+click
+toggles the row's entry into the multi-selection instead (the mods must be
+held *while* clicking — Rocks refreshes them at click time). The row of the
 selected entry (and rows selected as part of a larger selection) highlights.
 """
 function OutlinePanel(; doc = Observable(ArtObject[]),
@@ -48,7 +51,24 @@ function OutlinePanel(; doc = Observable(ArtObject[]),
             mark,
             E.text_element(art.name; color = fg, size = t.metrics.font_size,
                            font = t.font);
-            on_press = () -> (selection_obs[] = [index]),
+            on_press = () -> begin
+                # Ctrl/Shift+click toggles the entry into the multi-selection
+                # (the mods ride on the click — Rocks refreshes them at
+                # click time); a plain click selects exactly this entry, a
+                # shape never its parent group, a group never its parent.
+                if Rocks.LAST_KEYMODS[] & 0x00C3 != 0   # either Shift or Ctrl
+                    s = copy(selection_obs[])
+                    if index in s
+                        deleteat!(s, findfirst(==(index), s))
+                    else
+                        push!(s, index)
+                    end
+                    selection_obs[] = sort!(s)
+                else
+                    selection_obs[] = [index]
+                end
+                nothing
+            end,
             background = selected ? t.colors.selection : nothing,
             hover_background = selected ? t.colors.selection : t.colors.hot,
             pressed_background = selected ? t.colors.selection : t.colors.hot_border,

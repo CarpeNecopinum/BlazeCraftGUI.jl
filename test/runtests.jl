@@ -1195,11 +1195,13 @@ end
         # A group index expands into its whole subtree; shapes pass through.
         @test resolve_leaves(d2, [5]) == [1, 2, 3]
         @test resolve_leaves(d2, [1, 5]) == [1, 2, 3]
-        # The parent group is the *direct* holder: a/b sit in the inner
-        # group, c in the outer one; the outer group itself is top level.
-        @test parent_group(d2, 1) == 4
+        # The parent group is the *outermost* ancestor: a/b sit in the inner
+        # group, c in the outer one — both resolve up to the outer group;
+        # the outer group itself is top level.
+        @test parent_group(d2, 1) == 5
         @test parent_group(d2, 3) == 5
         @test parent_group(d2, 5) === nothing
+        @test parent_group(d, 1) == 4          # a single-level group
         # Top-level entries: the outermost group only.
         @test top_level_indices(d2) == [5]
         @test top_level_indices(group_arts([a, b, c], [1, 2])) == [3, 4]
@@ -1575,5 +1577,123 @@ end
         Rocks.flush_dirty!()
         Rocks.run_effects!()
         @test selection[] == [5]
+    end
+end
+
+@testset "group selection: outermost group from a nested click" begin
+    # Clicking a shape of a nested group selects the *outermost* group in
+    # its ancestor chain.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts(group_arts(
+        [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+         ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+         ArtObject("gamma", [ring(210.0, 100.0, 260.0, 140.0)], 1)],
+        [1, 2]), [4, 3])
+    # [alpha, beta, gamma, Group 1(alpha, beta), Group 2(Group 1, gamma)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        canvas = Rocks.find_kind(main, Rocks.Canvas)
+        cam = fit_camera(canvas.rect[3], canvas.rect[4], doc[])
+        m = matrix(cam)
+        pt(p) = begin
+            s = apply(m, p)
+            (round(Int, canvas.rect[1] + s[1]),
+             round(Int, canvas.rect[2] + s[2]))
+        end
+        click_at(p; mod = UInt16(0)) = begin
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN,
+                              Float32(p[1]), Float32(p[2]); mod = mod)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(canvas, SDL3.SDL_EVENT_MOUSE_BUTTON_UP,
+                              Float32(p[1]), Float32(p[2]); mod = mod)
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+
+        # Clicking alpha's outline (a member of the inner group) selects the
+        # outermost group.
+        click_at(pt(SVector(150.0, 100.0)))
+        @test selection[] == [5]
+        # Clicking gamma (a direct member of the outer group) — same unit.
+        click_at(pt(SVector(240.0, 100.0)))
+        @test selection[] == [5]
+        # Shift+click toggles the unit: the outermost group drops out.
+        click_at(pt(SVector(240.0, 100.0)); mod = 0x0001)
+        @test selection[] == Int[]
+        # Shift+click again brings it back.
+        click_at(pt(SVector(240.0, 100.0)); mod = 0x0001)
+        @test selection[] == [5]
+    end
+end
+
+@testset "outline: ctrl-click toggles into the multi-selection" begin
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(2)   # the outline page from the start
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts(group_arts(
+        [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+         ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+         ArtObject("gamma", [ring(210.0, 100.0, 260.0, 140.0)], 1)],
+        [1, 2]), [4, 3])
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+
+        # A plain click selects exactly that entry (the shape, no parent).
+        Rocks.click!(row(main, "alpha"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [1]
+
+        # Ctrl+click the group row toggles it into the multi-selection.
+        ctrl_click(f) = begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              mod = 0x0040)   # left button, Ctrl held
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              mod = 0x0040)
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        ctrl_click(row(main, "Group 1"))
+        @test sort(selection[]) == [1, 4]
+        # Ctrl+click again removes it.
+        ctrl_click(row(main, "Group 1"))
+        @test selection[] == [1]
+        # Ctrl+click the outer group too: both units at once.
+        ctrl_click(row(main, "Group 2"))
+        @test sort(selection[]) == [1, 5]
+        # A plain click collapses back to exactly that entry.
+        Rocks.click!(row(main, "gamma"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test selection[] == [3]
     end
 end
