@@ -1326,3 +1326,44 @@ them at click time). Rows live in a `ScrollView` so long documents scroll.
     the isolated SDL call `CreatePopupWindow` itself is fine, the *renderer* is not). Popup windows
     are now plain `BORDERLESS | ALWAYS_ON_TOP` windows positioned relative to their owner — the
     renderer works on those, and the menu's dismissal is in-app (`close_open_menus!`) anyway.
+
+### 8.16 Anti-aliased canvas lines (2026-10-31)
+
+SDL's line raster has no anti-aliasing, so the workspace's grid, borders, shape outlines and
+marching dashes rendered as hard-edged pixels. Rocks' `canvas_line` now draws every segment as a
+**feathered strip of three quads** through `SDL_RenderGeometry` with per-vertex alpha
+(`geometry_color(color, coverage)`): the core of `width` px at full alpha, fading to transparent
+over `LINE_FEATHER_PX` (0.75 px) on each side — the two feathers, the core and the two fades are
+one 8-vertex triangle strip, so diagonals read smooth on every renderer. The strip's *ends* stay
+square (segments meet other lines at corners; a fading end would open gaps in the grid and at
+shape joints). `ctx.polyline`/`draw_dashed_polyline` inherit this through `ctx.line`; polygon
+fills stay hard-edged (a feather there needs a stroke pass). Verified by a pixel-level Rocks test
+(a diagonal line's feather pixels blend part-way to the background, where the old raster painted
+hard pixels).
+
+The pixel-corner snapping (`snap_px`) stays: with the feather, a snapped axis-aligned line reads as
+a crisp 1 px core with soft edges, and the snap also keeps the grid stable while panning.
+
+### 8.17 Batched, cached line geometry (2026-10-31)
+
+Drawing every AA line as its own geometry call cost one draw call per segment — the grid alone is
+~120 calls per frame. Rocks' `CanvasContext` gained `ctx.lines(key; deps, build)`: `build` returns
+an iterable of `(x1, y1, x2, y2, color, width)` tuples; the built vertex/index buffers are cached
+**per canvas** (a `CanvasState` dict on the Canvas fiber's host state) under `key`, and while the
+caller's `deps` are `===` to the cached ones the batch re-issues the cached geometry — **one
+RenderGeometry call, no rebuild**. `deps` compare by identity, so app-side the natural key is the
+shape's art `id` with `deps = (obj, camera)`: a shape that didn't move (same immutable doc entry,
+same camera instance) is re-drawn from the cache; an edit or a camera change rebuilds exactly the
+affected batches. Returns whether the batch was (re)built.
+
+The Workspace batches everything: the grid and the bed border under the camera instance (a still
+camera re-issues them, no rebuild), each unselected shape under its art id, each selected shape's
+marching dashes and the selection frame/rotation lines per redraw (their dash phase animates —
+still one call each instead of dozens). The dash math moved into `dash_segments` (pure function)
+and the per-shape strokes into `stroke_segments`, both feeding the batches. `draw_segment`'s
+axis-aligned pixel snap is gone with it — the feathered strips rasterize consistently at
+sub-pixel positions, so the snap was a workaround for a raster that no longer exists.
+
+Stale cache entries (deleted shapes) stay in the per-canvas dict until the canvas is destroyed —
+harmless (ids are never reused); periodic pruning can come later if a long session makes it
+matter.

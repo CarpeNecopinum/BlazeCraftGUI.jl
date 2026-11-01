@@ -87,14 +87,15 @@ function draw_segment(ctx, m, segment; color, width)
 end
 
 """
-    draw_dashed_polyline(ctx, pts; color, width, dash, gap, phase, closed)
+    dash_segments(pts; dash, gap, phase, closed) -> Vector{Tuple}
 
-Draw a polyline as dashes of `dash` px separated by `gap` px gaps, shifted by
-`phase` px along the path (the marching-dashes animation). `closed` draws the
-closing segment back to the first point.
+The dash segments of one projected polyline (canvas-local px): dashes of
+`dash` px separated by `gap` px gaps, shifted by `phase` px along the path
+(the marching-dashes animation). `closed` draws the closing segment back to
+the first point.
 """
-function draw_dashed_polyline(ctx, pts; color = (0.0, 0.0, 0.0), width = 1.0,
-                              dash = 6.0, gap = 4.0, phase = 0.0, closed = false)
+function dash_segments(pts; dash = 6.0, gap = 4.0, phase = 0.0, closed = false)
+    segs = Tuple{Float64,Float64,Float64,Float64}[]
     period = dash + gap
     travelled = 0.0
     n = length(pts)
@@ -111,15 +112,40 @@ function draw_dashed_polyline(ctx, pts; color = (0.0, 0.0, 0.0), width = 1.0,
                 # boundary lands exactly on `pos`, a zero advance would spin
                 # forever on paths with many tiny segments.
                 stop = min(len, pos + max(dash - offset, 1e-6))
-                ctx.line(a[1] + ux * pos, a[2] + uy * pos,
-                         a[1] + ux * stop, a[2] + uy * stop;
-                         color = color, width = width)
+                push!(segs, (a[1] + ux * pos, a[2] + uy * pos,
+                             a[1] + ux * stop, a[2] + uy * stop))
                 pos = stop
             else
                 pos = min(len, pos + max(period - offset, 1e-6))
             end
         end
         travelled += len
+    end
+    return segs
+end
+
+"""
+    draw_dashed_polyline(ctx, pts; color, width, dash, gap, phase, closed, key, deps)
+
+Draw a polyline as dashes of `dash` px separated by `gap` px gaps, shifted by
+`phase` px along the path (the marching-dashes animation). `closed` draws the
+closing segment back to the first point. The dashes render as **one** geometry
+call; `key`/`deps` feed the canvas batch cache (`ctx.lines`) — with stable
+`deps` the batch re-issues its cached buffers instead of rebuilding.
+"""
+function draw_dashed_polyline(ctx, pts; color = (0.0, 0.0, 0.0), width = 1.0,
+                              dash = 6.0, gap = 4.0, phase = 0.0, closed = false,
+                              key = nothing, deps = nothing)
+    segs = dash_segments(pts; dash = dash, gap = gap, phase = phase,
+                         closed = closed)
+    isempty(segs) && return nothing
+    colored = ((x1, y1, x2, y2, color, width) for (x1, y1, x2, y2) in segs)
+    if key !== nothing
+        ctx.lines(key; deps = deps, build = () -> colored)
+    else
+        for (x1, y1, x2, y2, c, w) in colored
+            ctx.line(x1, y1, x2, y2; color = c, width = w)
+        end
     end
     return nothing
 end
@@ -160,6 +186,33 @@ function hit_shape(m, doc, x, y, threshold)
         end
     end
     return nothing
+end
+
+"""
+    stroke_segments(obj, m) -> Vector{Tuple}
+
+The anti-aliased stroke segments of one document entry, projected through
+the camera matrix into canvas-local pixels: `(x1, y1, x2, y2, color, width)`
+tuples in the entry's layer colour — one `ctx.lines` batch per shape (a
+shape that didn't move between frames is re-drawn from the cache without
+being rebuilt).
+"""
+function stroke_segments(obj::ArtObject, m)
+    color = layer_color(obj.layer)
+    segs = Vector{Tuple{Float64,Float64,Float64,Float64,typeof(color),Float64}}()
+    for pl in obj.paths
+        length(pl.points) < 2 && continue
+        pts = [apply(m, p) for p in pl.points]
+        for i in 1:(length(pts) - 1)
+            push!(segs, (pts[i][1], pts[i][2],
+                         pts[i+1][1], pts[i+1][2], color, 1.0))
+        end
+        if pl.closed && length(pts) > 2
+            push!(segs, (pts[end][1], pts[end][2], pts[1][1], pts[1][2],
+                         color, 1.0))
+        end
+    end
+    return segs
 end
 
 """
@@ -414,20 +467,23 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
     corners = [apply(m, p) for p in BED_CORNERS]
     ctx.polygon(corners; color = (0.94, 0.95, 0.96))
 
-    # The grid: 10 mm minors (thin) and 100 mm majors (thicker).
+    # The grid: 10 mm minors (thin) and 100 mm majors (thicker) — one
+    # geometry call for all of them, cached under the camera instance (a
+    # still camera re-issues the cached buffers, no rebuild).
     minor = (0.86, 0.87, 0.90)
     major = (0.78, 0.81, 0.84)
-    for segment in GRID_SEGMENTS.minor
-        draw_segment(ctx, m, segment; color = minor, width = 1.0)
-    end
-    for segment in GRID_SEGMENTS.major
-        draw_segment(ctx, m, segment; color = major, width = 2.0)
-    end
+    ctx.lines(:grid; deps = (camera,),
+              build = () -> Iterators.flatten((
+                  ((a[1], a[2], b[1], b[2], minor, 1.0)
+                   for (a, b) in GRID_SEGMENTS.minor),
+                  ((a[1], a[2], b[1], b[2], major, 2.0)
+                   for (a, b) in GRID_SEGMENTS.major))))
 
-    # The bed border doubles as the work-origin axes through (0, 0).
-    for segment in BED_SEGMENTS
-        draw_segment(ctx, m, segment; color = (0.55, 0.60, 0.65), width = 1.0)
-    end
+    # The bed border doubles as the work-origin axes through (0, 0) — cached
+    # under the camera like the grid.
+    ctx.lines(:bed; deps = (camera,),
+              build = () -> ((a[1], a[2], b[1], b[2], (0.55, 0.60, 0.65), 1.0)
+                             for (a, b) in BED_SEGMENTS))
 
     # Scan-mode layers paint their region fill first: the strokes still read
     # on top, and same-layer overlaps erase through the even-odd rule.
@@ -437,29 +493,33 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
     # they cover (a selected group's members run the marching dashes).
     selected_leaves = Set(resolve_leaves(doc, selection))
     for (idx, obj) in enumerate(doc)
-        selected = idx in selected_leaves
-        for (path_index, pl) in enumerate(obj.paths)
-            length(pl.points) < 2 && continue
-            pts = [apply(m, p) for p in pl.points]
-            if selected
-                # Each curve starts at its own position in the dash pattern
-                # (spread by the golden-ratio modulus, stable across frames),
-                # so short curves don't all flash in sync as the phase moves.
-                # Selected shapes keep their layer colour (§4: colour =
-                # layer) — the marching dashes trace it at double width.
-                draw_dashed_polyline(ctx, pts; color = layer_color(obj.layer),
-                                     width = 2.0,
-                                     phase = dash_phase + mod(path_index * 2.399963, 10.0),
-                                     closed = pl.closed)
-            else
-                ctx.polyline(pts; color = layer_color(obj.layer), width = 1,
-                             closed = pl.closed)
+        if idx in selected_leaves
+            # The marching dashes animate (the phase moves) — rebuilt each
+            # redraw, but one geometry call per shape and path.
+            for (path_index, pl) in enumerate(obj.paths)
+                length(pl.points) < 2 && continue
+                pts = [apply(m, p) for p in pl.points]
+                ctx.lines((obj.id, path_index, :dash);
+                          deps = (obj, camera, dash_phase, path_index),
+                          build = () ->
+                              ((x1, y1, x2, y2, layer_color(obj.layer), 2.0)
+                               for (x1, y1, x2, y2) in dash_segments(
+                                   pts; dash = 6.0, gap = 4.0,
+                                   phase = dash_phase +
+                                           mod(path_index * 2.399963, 10.0),
+                                   closed = pl.closed)))
             end
+        else
+            # One geometry call per shape: the AA strokes are cached under
+            # the art's id — a shape that didn't move (same doc entry, same
+            # camera) is re-drawn from the cache without being rebuilt.
+            ctx.lines(obj.id; deps = (obj, camera),
+                      build = () -> stroke_segments(obj, m))
         end
     end
 
     # The rectangle tool's in-progress drag: a dashed preview above the
-    # document, in the active layer's colour.
+    # document, in the active layer's colour — one geometry call.
     if preview !== nothing
         ((sx, sy), (ex, ey)) = preview
         a = apply(m, SVector(sx, sy))
@@ -467,7 +527,9 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
         draw_dashed_polyline(ctx, [(a[1], a[2]), (b[1], a[2]),
                                    (b[1], b[2]), (a[1], b[2])];
                              color = preview_color, width = 1.5,
-                             dash = 5.0, gap = 3.0, closed = true)
+                             dash = 5.0, gap = 3.0, closed = true,
+                             key = :preview, deps = (camera, preview,
+                                                     preview_color))
     end
 
     # The cursor tool's in-progress marquee: dashed, green for an overlap
@@ -487,7 +549,8 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                                    (pb[1], pb[2]), (pa[1], pb[2]),
                                    (pa[1], pa[2])];
                              color = color, width = 1.5,
-                             dash = 5.0, gap = 3.0, closed = true)
+                             dash = 5.0, gap = 3.0, closed = true,
+                             key = :marquee, deps = (camera, marquee))
     end
 
     # The selection decor: the selected shapes' outlines already run the
@@ -502,15 +565,21 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
         bbox = selection_union_bbox(m, doc, selection)
         if bbox !== nothing
             (x0, y0, x1, y1) = bbox
+            # The frame's dashes animate with the phase — rebuilt each
+            # redraw, one geometry call for the box and the rotation lines.
             draw_dashed_polyline(ctx, [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
                                  color = (0.15, 0.35, 0.9), width = 1.0,
-                                 dash = 4.0, gap = 3.0, phase = dash_phase)
+                                 dash = 4.0, gap = 3.0, phase = dash_phase,
+                                 key = :selection_frame,
+                                 deps = (camera, bbox, dash_phase))
             handles = selection_handles(bbox)
-            # Thin lines from the corners out to the rotation handles.
-            for (corner, rot) in zip(handles.corners, handles.rotate)
-                ctx.line(corner[1], corner[2], rot[1], rot[2];
-                         color = (0.15, 0.35, 0.9), width = 1.0)
-            end
+            # Thin lines from the corners out to the rotation handles —
+            # one geometry call, cached under the camera and the frame bbox.
+            ctx.lines(:selection_rotations; deps = (camera, bbox),
+                      build = () -> ((c[1], c[2], r[1], r[2],
+                                      (0.15, 0.35, 0.9), 1.0)
+                                     for (c, r) in
+                                     zip(handles.corners, handles.rotate)))
             for (hx, hy) in handles.rotate
                 draw_handle(ctx, hx, hy; fill = (0.85, 0.9, 1.0))
             end
