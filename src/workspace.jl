@@ -486,7 +486,8 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                         fill_cache = Dict{Int,Any}(),
                         preview = nothing,
                         preview_color = (0.1, 0.1, 0.1),
-                        marquee = nothing)
+                        marquee = nothing,
+                        frame = nothing)
     _, _, cw, ch = ctx.rect
     m = matrix(camera)
     ctx.clear((0.86, 0.87, 0.89))          # tone outside the work area
@@ -557,6 +558,20 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
                              dash = 5.0, gap = 3.0, closed = true,
                              key = :preview, deps = (camera, preview,
                                                      preview_color))
+    end
+
+    # The Laser tab's framing preview: the selection's rectangle/convex
+    # hull outline (the framing move the laser would trace), red, above the
+    # document — one geometry call per path.
+    if frame !== nothing
+        for (i, pl) in enumerate(frame)
+            length(pl.points) < 2 && continue
+            pts = [apply(m, p) for p in pl.points]
+            draw_dashed_polyline(ctx, pts; color = (0.85, 0.15, 0.1),
+                                 width = 1.5, dash = 5.0, gap = 3.0,
+                                 closed = pl.closed, key = (:frame, i),
+                                 deps = (camera, frame, i))
+        end
     end
 
     # The cursor tool's in-progress marquee: dashed, green for an overlap
@@ -683,13 +698,15 @@ function Workspace(; doc = Observable(ArtObject[]),
                    processes = Observable(Dict{Int,Process}()),
                    tool = Observable(:mouse),
                    active_layer = Observable(0),
-                   ctx_open = Observable(false), props...)
+                   ctx_open = Observable(false),
+                   frame = Observable(PolyLine[]), props...)
     doc_obs = @use doc
     selection_obs = @use selection
     processes_obs = @use processes
     tool_obs = @use tool
     active_obs = @use active_layer
     ctx_obs = @use ctx_open
+    frame_obs = @use frame
 
     # Per-layer fill textures (fills.jl): canvas-local software textures,
     # recreated when their layer's geometry, mode or the camera changes.
@@ -781,7 +798,8 @@ function Workspace(; doc = Observable(ArtObject[]),
                                preview = rect_drag[] === nothing ? nothing :
                                          (drag_start[], rect_drag[]),
                                preview_color = layer_color(active_obs[]),
-                               marquee = marquee[])
+                               marquee = marquee[],
+                               frame = frame_obs[])
             end,
             # The bed tone distinguishes the canvas from the desktop gray
             # that Tools panels use in Rocks' Enterprise theme.

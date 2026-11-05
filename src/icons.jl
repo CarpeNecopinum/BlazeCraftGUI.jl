@@ -37,6 +37,10 @@ const MDI_GLYPHS = Dict{String,Char}(
     "align-vertical-bottom" => Char(0xf11c5),
     "align-vertical-center" => Char(0xf11c6),
     "align-vertical-top" => Char(0xf11c7),
+    # laser section
+    "focus-auto" => Char(0xf0f4e), "rectangle-outline" => Char(0xf0e5f),
+    "vector-polygon" => Char(0xf0560), "run" => Char(0xf070e),
+    "tune" => Char(0xf062e),
     # state toggles
     "lock" => Char(0xf033e), "lock-open" => Char(0xf033f),
 )

@@ -2383,3 +2383,154 @@ end
         @test doc[] == before
     end
 end
+
+@testset "laser section" begin
+    # The right pane's second tabber: big buttons (Start, Autofocus, the
+    # selection's rectangle/hull outlines, Save GCode, Run GCode file), the
+    # jog pad with Home, and the Laser Setup dialog (tab button or the
+    # menubar's Settings → Machine Setup). v1 runs against a virtual head.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    laser_pos = Observable(Point(0.0, 0.0))
+    machine = Observable((host = "", bed_w = 400.0, bed_h = 300.0, jog = 10.0))
+    laser_status = Observable("")
+    setup_open = Observable(false)
+    frame = Observable(PolyLine[])
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = [ArtObject("a", [ring(10.0, 10.0, 30.0, 20.0)], 0),
+             ArtObject("b", [ring(100.0, 50.0, 130.0, 70.0)], 0)]
+    selection[] = [1, 2]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              laser_pos = laser_pos, machine = machine,
+                              laser_status = laser_status,
+                              setup_open = setup_open, frame = frame)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        sync() = begin
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+            # effect writes mark fibers dirty again: a second round settles
+            # them before the re-draw
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+            wins = Rocks.sync_windows!(root)
+            main = wins[findfirst(
+                w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, wins)]
+            Rocks.draw_window!(main)
+        end
+
+        # The tab's big buttons exist.
+        @test row(main, "Start") !== nothing
+        @test row(main, "Autofocus") !== nothing
+        @test row(main, "Rect outline") !== nothing
+        @test row(main, "Hull outline") !== nothing
+        @test row(main, "Save GCode") !== nothing
+        @test row(main, "Run GCode file") !== nothing
+
+        # The framing buttons compute the outline paths into `frame`: the
+        # selection's bounding rectangle, then its hull (the same 4 corners
+        # for two rectangles).
+        Rocks.click!(row(main, "Rect outline"))
+        sync()
+        @test length(frame[]) == 1 && frame[][1].closed
+        @test frame[][1].points ==
+              Point.([(10, 10), (130, 10), (130, 70), (10, 70)])
+        Rocks.click!(row(main, "Hull outline"))
+        sync()
+        @test length(frame[]) == 1 && frame[][1].closed
+        # The two rectangles sit diagonally: the true hull has 6 corners
+        # (a's bottom-right and b's top-left stick out of the bbox).
+        @test length(frame[][1].points) == 6
+        @test Point(10, 10) in frame[][1].points
+        @test Point(130, 70) in frame[][1].points
+
+        # Jog: the pad's arrows move the head by the machine's jog step,
+        # clamped to the bed; Home returns to the work origin.
+        pad() = Rocks.find_fibers(
+            Rocks.find_kind(main, LaserTab)) do fib
+            fib.kind === Rocks.Pressable && fib.rect[3] ≈ 22.0
+        end
+        @test length(pad()) == 5              # up/left/home/right/down
+        Rocks.click!(pad()[1])                # up
+        sync()
+        @test laser_pos[] == Point(0.0, 10.0)
+        Rocks.click!(pad()[4])                # right
+        sync()
+        @test laser_pos[] == Point(10.0, 10.0)
+        laser_pos[] = Point(395.0, 0.0)
+        sync()
+        Rocks.click!(pad()[4])                # right: clamped at the bed edge
+        sync()
+        @test laser_pos[] == Point(400.0, 0.0)
+        Rocks.click!(pad()[3])                # home
+        sync()
+        @test laser_pos[] == Point(0.0, 0.0)
+
+        # The device-dependent buttons report through the status line: no
+        # device configured — the Laser Setup hint.
+        Rocks.click!(row(main, "Start"))
+        sync()
+        @test occursin("no device", laser_status[])
+        machine[] = (host = "http://octopi:7125", bed_w = 400.0,
+                     bed_h = 300.0, jog = 10.0)
+        sync()
+        Rocks.click!(row(main, "Start"))
+        sync()
+        @test occursin("sent to", laser_status[])
+
+        # Laser Setup: opens via the tab's button — its own OS window.
+        @test !setup_open[]
+        Rocks.click!(row(main, "Laser Setup"))
+        sync()
+        @test setup_open[]
+        wins = Rocks.sync_windows!(root)
+        dlg = findfirst(w -> get(w.props, :title, "") == "Laser Setup", wins)
+        @test dlg !== nothing
+        # The dialog's fields sync from the stored machine on open.
+        dlg_texts(f, acc = String[]) = begin
+            f.kind === Rocks.Text &&
+                append!(acc, string.(get(f.props, :children, ())))
+            foreach(c -> dlg_texts(c, acc), f.children)
+            acc
+        end
+        texts = dlg_texts(wins[dlg])
+        @test "http://octopi:7125" in texts
+        # Cancel discards.
+        Rocks.click!(row(wins[dlg], "Cancel"))
+        sync()
+        @test !setup_open[]
+
+        # The menubar's Settings → Machine Setup opens the dialog too (the
+        # menu-title button is the narrow Pressable inside the bar's row
+        # wrapper).
+        menubar_entry(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable && fib.rect[3] < 100 &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        Rocks.click!(menubar_entry(main, "Settings"))
+        sync()
+        wins = Rocks.sync_windows!(root)
+        popups = [w for w in wins if Bool(get(w.props, :popup, false))]
+        @test length(popups) == 1
+        Rocks.click!(row(only(popups), "Machine Setup"))
+        sync()
+        @test setup_open[]
+        wins = Rocks.sync_windows!(root)
+        dlg = findfirst(w -> get(w.props, :title, "") == "Laser Setup", wins)
+        @test dlg !== nothing
+        Rocks.click!(row(wins[dlg], "Cancel"))
+        sync()
+        @test !setup_open[]
+    end
+end

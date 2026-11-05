@@ -1547,3 +1547,39 @@ The buttons gray out below two selected roots and write one `align_arts` result 
     rectangle's left edge is the aligned edge, so a following x-centre centres on the *new*
     rectangle. Tests must chain expectations through the compound sequence (the per-click
     math is pinned by the `align_arts` testset on fresh docs).
+
+### 8.21 The Laser section (2026-11-05)
+
+The right pane gained a **second tabber** south of the document tabber: the **Laser** tab
+(`src/laser.jl`). Big buttons up top — Start, Autofocus, the selection's rectangle and convex
+hull outlines, Save GCode, Run GCode file (2 per row; 96×44 with icon + caption) — then the
+jog pad (four arrows around a centre Home) with the head readout and the status line, and the
+**Laser Setup** entry. v1 runs against a *virtual head*: jog/home move it within the bed by
+the machine's jog step (`machine` NamedTuple: host, bed_w, bed_h, jog — editable through the
+dialog), the framing buttons compute the selection's bounding rectangle / `convex_hull`
+outline (*new BlazeCraft API*, Andrew's monotone chain) into `frame`, which the workspace
+draws as a red dashed overlay, and the device-dependent buttons report through the status
+line until a sink is wired. The dialog opens from the tab's button *or* the menu bar's
+**Settings → Machine Setup**.
+
+**Gotchas of this round**:
+
+65. **A tabber's content must fit its viewport — the status bar waits underneath** — the
+    first Laser tab was taller than the right pane's share and the overflow slid under the
+    app's status bar, whose 1100×22 rect then *won the hit-test* (`hit_test` clips host
+    Boxes by their rect; the buttons *drew* but never received a click). Compact buttons and
+    a `ScrollView` keep the controls inside the client area.
+66. **Rows overflow their pane horizontally too** — pad + readout + setup button measured
+    ~290 px in a ~206 px pane: the setup button landed outside the window. Stack what
+    doesn't fit (the setup button got its own row).
+67. **MDI icon names mix conventions** — the older entries use underscores (`arrow_up`),
+    the align/laser families hyphens (`align-horizontal-left`): a hyphenated jog icon
+    KeyError'd the dict. `mdi_glyph(name)` (the `get` fallback) is the safer lookup.
+68. **`E.Label` is keyword-only** (`text =`), `Mechanics.Button` takes no layout kwargs
+    (no `direction`/`align`/`justify`), and `E.TabControl` requires a `selected` Observable.
+69. **The menu bar's titles are narrow Pressables inside the bar's row wrapper** — a label
+    finder matching the wrapper (1100 px wide, `on_press = close`) clicks the bar itself and
+    never opens the dropdown; filter by width (< 100 px) to address the title button.
+70. **Probe idiom: effect writes need a second round** — a `useEffect` that writes an
+    Observable during `run_effects!` marks fibers dirty *again*; headless tests must flush +
+    run effects a second time before the re-draw (the live loop does this implicitly).

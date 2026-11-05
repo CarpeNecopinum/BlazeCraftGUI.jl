@@ -18,13 +18,14 @@ include("filedialog.jl")
 include("icons.jl")
 include("workspace.jl")
 include("outline.jl")
+include("laser.jl")
 include("app.jl")
 
 "Run the app window (headless runs accept `frames = n, screenshot = \"…\"`)."
 run_gui(; kw...) = render(App; kw...)
 
 export App, PositionToolbar, LayerBar, CutsLayersPanel, OutlinePanel, ProcessEditor,
-       ToolsPanel,
+       ToolsPanel, LaserTab, LaserSetupDialog,
        rect_art, ArtObject, is_group, import_art, center_on_workarea,
        group_arts, ungroup_arts, delete_arts, resolve_leaves, parent_group,
        top_level_indices, leaves_of, child_indices, art_index, art_bounds,

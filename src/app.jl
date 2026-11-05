@@ -575,7 +575,9 @@ end
 function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing,
              active_layer = nothing, processes = nothing,
              editor_open = nothing, edit_layer = nothing, tool = nothing,
-             panel_tab = nothing, ctx_open = nothing, anchor = nothing)
+             panel_tab = nothing, ctx_open = nothing, anchor = nothing,
+             machine = nothing, laser_pos = nothing, laser_status = nothing,
+             setup_open = nothing, frame = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
@@ -608,6 +610,8 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     # outline second; injectable for tests.
     panel_tab_internal = @use Observable(1)
     panel_tab = panel_tab === nothing ? panel_tab_internal : panel_tab
+    # The Laser tabber's tab (one for now).
+    laser_tab = @use Observable(1)
     # The workspace context menu (Group / Ungroup): the open flag only —
     # the workspace's right click flips it and the menu anchors itself at
     # the click. Injected into the Workspace as a prop; injectable for
@@ -624,6 +628,21 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     pending_open = @use Observable{Union{Nothing,FileDialogResult}}(nothing)
     error_open = @use Observable(false)
     last_error = @use Observable("")
+
+    # The Laser section (§5.9): the machine's settings (Laser Setup), the
+    # (virtual) head position, the tab's status line and the framing
+    # preview (the selection's rectangle/hull outline) — injectable like
+    # `doc`/`selection`.
+    machine_internal = @use Observable(DEFAULT_MACHINE)
+    machine = machine === nothing ? machine_internal : machine
+    laser_pos_internal = @use Observable(Point(0.0, 0.0))
+    laser_pos = laser_pos === nothing ? laser_pos_internal : laser_pos
+    laser_status_internal = @use Observable("disconnected — open Laser Setup")
+    laser_status = laser_status === nothing ? laser_status_internal : laser_status
+    setup_open_internal = @use Observable(false)
+    setup_open = setup_open === nothing ? setup_open_internal : setup_open
+    frame_internal = @use Observable(PolyLine[])
+    frame = frame === nothing ? frame_internal : frame
 
     # Consume the native file dialog's result on the main thread. The dialog
     # callback (which may run on another thread) only fills `pending_open`;
@@ -660,6 +679,10 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
             E.MenuItem(label = "Open…",
                        on_press = () -> show_open_file_dialog!(pending_open)),
         ]),
+        E.Menu("Settings", items = [
+            E.MenuItem(label = "Machine Setup",
+                       on_press = () -> (setup_open[] = true)),
+        ]),
     ]))
 
     return E.Form(
@@ -695,7 +718,8 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                         (@rock Workspace(doc = doc, selection = selection,
                                          processes = processes, tool = tool,
                                          active_layer = active_layer,
-                                         ctx_open = ctx_open;
+                                         ctx_open = ctx_open,
+                                         frame = frame;
                                          flex = 1, fill = true)),
                         # The layer palette sits as a strip directly below
                         # the workspace — same width as the canvas, outside
@@ -721,13 +745,31 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                                                     anchor = anchor;
                                                     fill = true, flex = 1)),
                             ];
+                            flex = 1, fill = true)),
+                        # The Laser section: the second tabber, south of the
+                        # document tabber.
+                        (@rock E.TabControl(
+                            tabs = ["Laser"], selected = laser_tab,
+                            children = Any[
+                                (@rock LaserTab(doc = doc,
+                                                selection = selection,
+                                                laser_pos = laser_pos,
+                                                machine = machine,
+                                                laser_status = laser_status,
+                                                setup_open = setup_open,
+                                                frame = frame;
+                                                fill = true, flex = 1)),
+                            ];
                             flex = 1, fill = true));
-                        fill = true));
+                        direction = :column, gap = 0, fill = true));
                     direction = :horizontal, ratio = split_ratio,
                     flex = 1, fill = true));
                 gap = 2, fill = true, height = "100%")),
             (@rock ProcessEditor(open = editor_open, layer = edit_layer,
                                  processes = processes)),
+            # The Laser Setup dialog: the machine's settings, opened from the
+            # Laser tab's button or the menu bar's Settings → Machine Setup.
+            (@rock LaserSetupDialog(open = setup_open, machine = machine)),
             # The workspace context menu (right click): Group / Ungroup over
             # the current selection. Anchors at the pointer by default.
             (@rock WorkspaceContextMenu(doc = doc, selection = selection,
