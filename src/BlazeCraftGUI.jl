@@ -28,6 +28,7 @@ export App, PositionToolbar, LayerBar, CutsLayersPanel, OutlinePanel, ProcessEdi
        rect_art, ArtObject, is_group, import_art, center_on_workarea,
        group_arts, ungroup_arts, delete_arts, resolve_leaves, parent_group,
        top_level_indices, leaves_of, child_indices, art_index, art_bounds,
+       holder_group, ancestor_chain, common_group, prune_empty_groups,
        translate, scale, rotate, set_layer, layer_color, layer_label,
        is_tool_layer, CUT_LAYERS, LAYER_COLORS_HEX, MODES, mode_label,
        CutSettings, Process, document_layers, process_for, with_process,

@@ -547,17 +547,24 @@ moves = generateMoves(cut)     # Vector{Move} — hand-inserts overscan + travel
 ### 3.3 Importers
 
 ```julia
-using BlazeCraft.Importers: load_dxf_instructions, extract_polys, load_svg
+using BlazeCraft.Importers: load_dxf_instructions, extract_structured,
+                            extract_polys, weld_contours, load_svg
 
-inst = load_dxf_instructions(io)                    # raw DXF entities
-polys = extract_polys(inst)                         # Dict{layer_name, Vector{PolyLine}}
-ms    = load_svg(str_or_io; flip_y = true, tolerance = 0.01)   # path/polygon/polyline/rect + transform; XML.jl
+inst   = load_dxf_instructions(io)                 # raw DXF entities
+units  = extract_structured(inst; tol = 1e-3)      # Vector{DXFUnit}: :layer/:block/:group units
+polys  = extract_polys(inst)                       # Dict{layer_name, Vector{PolyLine}} — flat, welded view
+welded = weld_contours(layer_poly_pairs; tol = 1e-3)  # endpoint chains → one poly each
+ms     = load_svg(str_or_io; flip_y = true, tolerance = 0.01)   # path/polygon/polyline/rect + transform; XML.jl
 ```
 
 * SVG importer handles `path/polygon/polyline/rect` with `transform`, groups → nested `MultiShape`, and **adaptively
   subdivides curves to a `tolerance`** (already the right shape for LightBurn's Curve-Tolerance model — default the
   resolution up for output vs. display as needed).
-* DXF importer is instruction-level + per-layer extraction. No exporter exists yet (DXF/SVG/AI export, machine-file
+* DXF importer is instruction-level + **structured** extraction (`extract_structured`): layer buckets, exploded
+  `INSERT` instances (affine placement, nested recursion, `MINSERT` arrays) and `ACAD_GROUP` memberships, each a
+  `DXFUnit`; `extract_polys` is its flat layer-keyed collapse. **Contour welding** (`weld_contours`, default
+  tolerance a µm) runs per layer bucket / per exploded instance: chains of endpoint-sharing primitives become one
+  poly each — closed when the chain's ends meet. No exporter exists yet (DXF/SVG/AI export, machine-file
   export, and the `.lbrn2`-equivalent format are all to be built — see `08-file-formats.md`).
 
 ### 3.4 Sinks
@@ -1255,10 +1262,18 @@ selection)` (the "what geometry does my selection own" helper every consumer goe
 the whole group" resolves to the outermost level, which is also what makes the click unit and the
 marquee's top-level units agree), `top_level_indices` (the marquee's selection units),
 `art_bounds(doc, idx)` (a group's bbox = the union over its subtree — what makes a group act like a
-single shape), `group_arts` / `ungroup_arts` / `delete_arts`. Ungrouping dissolves **one level**:
-the members take the group's place — in the parent group's children when nested (LightBurn's
-ungroup promotes into the parent), at the top level otherwise. Deleting a shape prunes it from its
-group's `children`; deleting a group node dissolves it.
+single shape), `group_arts` / `ungroup_arts` / `delete_arts`. Grouping **places the new group into
+the innermost common group** of all members when they share one (`holder_group`/`ancestor_chain`/
+`common_group` walk the id-based ancestor chains — with the members' *previous holders releasing
+them* at the same time, so an entry lists under exactly one group: the outline would otherwise
+duplicate every row under both the old and the new node). With no common group (some member is top
+level) the new group lands there and still pulls the members out of their holders; a holder emptied
+by the move is pruned (`prune_empty_groups`, cascading). Members nested inside other selected
+members don't join — the ancestor carries their subtree. The new group is still the **last doc
+entry** either way, so "the selection becomes the new group" is `length(doc)`. Ungrouping dissolves
+**one level**: the members take the group's place — in the parent group's children when nested
+(LightBurn's ungroup promotes into the parent), at the top level otherwise. Deleting a shape prunes
+it from its group's `children`; deleting a group node dissolves it.
 
 **Group-aware selection and marquee** (`src/workspace.jl`): a canvas click maps the hit leaf
 through `parent_group` — the click unit is the *outermost* group in the shape's ancestor chain (the
@@ -1288,11 +1303,19 @@ dismisses the menu and is swallowed as the gesture.
 new `OutlinePanel` are pages of an `E.TabControl` (`tabs = ["Cuts / Layers", "Outline"]`, selected
 = an injectable Observable). The outline is an indented tree of every entry with members indented
 under their group (shapes carry a square in their layer colour, groups an outlined box mark); the
-tree is virtual — it reads the flat document and walks `child_indices`, so it needs no state. A
+tree is virtual — it reads the flat document and walks `child_indices`, so it needs no state;
+**subgroups list at the top of their super-group** (containers before their sibling shapes, both
+top level and inside groups — the outline order is `outline_children`'s: groups first, doc order
+within each class, and the row order is preordered into `row_order` so ranges read visually). A
 plain row click selects **exactly** that entry: a shape row selects only the shape (never a parent
-group), a group row selects the group (its members follow by membership); Ctrl/Shift+click toggles
-the row's entry into the multi-selection instead (the mods ride on the click — Rocks refreshes
-them at click time). Rows live in a `ScrollView` so long documents scroll.
+group), a group row selects the group (its members follow by membership); **Ctrl+click toggles the
+row's entry into the multi-selection (individual)** while **Shift+click selects the row range**
+between the anchor row — the last plain-/Ctrl-clicked one, carried in the `anchor` Observable prop
+— and the clicked one, in visible row order (the mods ride on the click — Rocks refreshes them at
+click time). **Right-clicking a row** selects it (unless it is already part of the
+selection — a multi-selection survives) and opens the same context menu the workspace's right
+click uses (`ctx_open` is shared; the menu's Group/Ungroup act on the selection — grouping a row's
+entry from the outline works end to end). Rows live in a `ScrollView` so long documents scroll.
 
 ![Outline tab: nested groups, indented members, exact-entry selection](analysis/images/screenshots/blazecraft-outline.png)
 
@@ -1302,6 +1325,12 @@ them at click time). Rows live in a `ScrollView` so long documents scroll.
     an entry with no paths, so it returned `(Inf…, -Inf…)` instead of `nothing` and the Position
     toolbar's effect happily wrote `NaN`/`-Inf` into the spinners. It now returns `nothing` when no
     geometry was found; a group's bounds must go through `art_bounds` (the union over its leaves).
+49a. **Two nodes claiming one member duplicates the outline** — the virtual tree is opinionated:
+     an entry is shown under *every* group whose `children` holds it. `group_arts` once just
+     appended the new group beside the existing holder, so regrouping alpha+beta out of Group 1
+     showed alpha and beta under **both** nodes ("grouping copies the shapes into the new group").
+     Any writer of `children` must keep the single-holder invariant: `group_arts` releases members
+     from their previous holders and prunes emptied ones; keep it that way in future edits.
 50. **The shell body does not re-render on selection changes** — Rocks re-renders the *fibers that
     read a change* (`@use` subscribers); a plain `selection[]` read in the `App` body builds a
     stale snapshot, and the context menu's items stayed disabled after the selection moved. State
@@ -1360,10 +1389,129 @@ The Workspace batches everything: the grid and the bed border under the camera i
 camera re-issues them, no rebuild), each unselected shape under its art id, each selected shape's
 marching dashes and the selection frame/rotation lines per redraw (their dash phase animates —
 still one call each instead of dozens). The dash math moved into `dash_segments` (pure function)
-and the per-shape strokes into `stroke_segments`, both feeding the batches. `draw_segment`'s
-axis-aligned pixel snap is gone with it — the feathered strips rasterize consistently at
-sub-pixel positions, so the snap was a workaround for a raster that no longer exists.
+and the per-shape strokes into `stroke_segments`, both feeding the batches.
+
+**Gotchas while building this**:
+
+54. **The batched grid must be projected through the camera** — the first version passed the raw
+    world-space `GRID_SEGMENTS` to the strip builder (which takes canvas-local px), so the grid
+    rendered at 0..300 px in the workspace's upper-left corner and never moved with the bed while
+    the shapes (whose `stroke_segments` *did* project) panned correctly. `projected_segments` now
+    applies the camera matrix — and keeps the old `draw_segment` behaviour of snapping
+    axis-aligned segments to whole pixels (a crisp grid; arbitrary-angle shapes stay float).
+55. **The AA feather must not outgrow the line** — the first ramp (0.75 px per side on a full-width
+    core) made every line read ~75 % thicker. The ramp is now 0.4 px per side on a core of the
+    nominal `width`: thin again, with the ramps sub-pixel on a pixel-centre rasterizer and visible
+    where a line lands between pixels. Shrinking the *core* instead (the textbook 50 %-contour
+    trick) is not an option: a sub-pixel-wide core quad gets missed entirely by pixel-centre
+    sampling — the line's centre pixel silently vanishes.
 
 Stale cache entries (deleted shapes) stay in the per-canvas dict until the canvas is destroyed —
 harmless (ids are never reused); periodic pruning can come later if a long session makes it
 matter.
+
+56. **One-line strings have a texture ceiling** — importing a DXF (one `ArtObject` per primitive)
+    made `doc_summary` join hundreds of names into a single status-bar line, and the Text fiber's
+    TTF surface came out wider than SDL's 32768 px texture limit — `CreateTextureFromSurface`
+    aborted the draw. Two fixes: the summary now lists the top-level structure (groups as
+    `name (N primitives)`) and folds beyond `SUMMARY_MAX_PARTS` entries into `… (N more)`; and
+    Rocks' text rendering clamps every line to `MAX_TEXT_LINE_PX` (16000 px) with an ellipsis
+    (`clamp_text_line`, measured via `TTF_GetStringSize` — the SDL2-era `TTF_SizeUTF8` symbol no
+    longer exists), so no string can crash a draw again.
+
+### 8.18 DXF structure + contour welding (2026-11-03)
+
+**Import grouping** (§8.15's model): `import_art` returns **one `ArtObject` per primitive**
+(each flattened `PolyLine`, named `"file N"` — `"file/layer N"` for DXF layers, the palette layer
+assigned per primitive) with a **group entry around the whole file's contents named after the
+file** — so the outline shows `unicorn.svg` with its primitives indented below. A
+single-primitive file imports as-is (no group around one entry); `group_arts` gained an optional
+`name` kwarg for it (the context menu's Group action still names groups `"Group N"`).
+
+**DXF containers** (round of 2026-11-01): a DXF carries its own structure, and the import
+uses it instead of the flat per-layer view. `BlazeCraft.Importers.extract_structured`
+(*new API*) yields `Vector{DXFUnit}` — `DXFUnit(name, kind, poly_layers, polys)` with
+`kind = :layer` (entities of no other container), `:block` (one `INSERT`, exploded through an
+affine `DxfTransform` — nested blocks recurse with composed transforms, `MINSERT` arrays keep
+all their cells in one unit, `*`-prefixed system blocks and unresolvable references drop with a
+`@warn`) and `:group` (the file's `ACAD_GROUP` objects, members claimed **first-claim-wins** by
+handle; a claimed instance or entity lists under its group *only*). `extract_polys` stays the
+flat layer-keyed collapse over the units — the old contract, now informed by the structure
+(block geometry comes through instead of landing twice). The GUI maps each multi-shape unit to
+a `[file/name]` group: layer buckets first (sorted — the palette structure), then block
+instances and named groups in file order (repeats get ` #k`); the palette layer per DXF layer
+(sorted names, `00` on, wrap at 30). Result on the test file: `plate.dxf → cut (8 arcs),
+engraving (422 shapes)` as 3 tree rows.
+
+**Contour welding** (round of 2026-11-03): those 8 cut arcs are not 8 cuts — they are one
+closed plate outline cut by 8 primitives sharing endpoints. `BlazeCraft.Importers` gained
+`weld_contours(pairs; tol = 1e-3)`: open primitives whose endpoints coincide (within `tol`, a
+µm by default) chain into **one** poly each, and a chain whose ends meet comes out **closed** —
+the laser gets one closed cut path instead of 8 open ones. Design:
+
+* per-layer welds only (a contour is endpoint contact in one drawing context); the weld lives
+  in `extract_structured` (λ layer buckets and exploded block instances, `tol` kwarg) — **named
+  group members stay unwelded** (the file's explicit grouping is not a weld context);
+* endpoint matching is a **quantized-grid lookup**: tips register in the nearest grid cell of
+  size `tol`, lookups scan the 3×3 cell neighbourhood — no O(n²) distance wall, no missed
+  near-cell match;
+* **ambiguous tips never weld**: a tip meeting more than one other tip (or meeting both its own
+  chain's far end *and* a third piece) stays open — tangent contours don't merge; closed polys
+  (circles, closed polylines) pass through untouched;
+* chains grow from either tip (extension order is the piece list, not the file's drawing
+  order); the traversal direction of each piece is free.
+
+Verified: plate.dxf's 8 cut arcs (R 200.5 mm alternating with R 16.75 mm) weld into **one
+closed 37-point shape** at the µm default; the engraving layer's 422 primitives chain into 48
+closed shapes (glyphs and knots); the file imports as `plate.dxf → cut 1 (shape),
+engraving (48 shapes)` — 51 entries, down from 433, and the whole cut outline selects with a
+single box. Suite impact: BlazeCraft 121 tests (weld testset: triangle close, neighbour-cell
+match, flipped traversal, open chain, self-touching close, circle passthrough, Y-junction
+no-merge, cross-layer non-merge, through-`extract_structured`), GUI suite green with the new
+counts (`import_art: dxf layers pre-group` became the weld-count test).
+
+**Gotchas of this round**:
+
+57. **A chain seed is not a consumed piece** — the first weld grew every seed in one pass and
+    marked it used; when a *later* seed then reached a *finished* chain and consumed it, the
+    finished chain was skipped by the output pass (its geometry lived in the consumer, whose
+    own used-flag was set at seed time — so everything the chain had absorbed vanished). The
+    fix separates `consumed` (absorbed into another chain — skipped on output) from the seed
+    pass: a finalized chain keeps its registration until another chain absorbs it.
+58. **The closing joint point is a duplicate** — when a chain's far end reaches back to its
+    start, the last appended piece already delivered a point ≈ the chain's first. Closed
+    polys don't repeat their first point (see `RegularPolygon`/`_circle`), so the closure
+    `pop!`s the joint copy; without it every welded ring gains one near-zero-length segment
+    that later offsets/hatching must tolerate.
+59. **`@view` inside a docstring'd function fails the package precompile** (Julia 1.13 + 
+    DocStringExtensions' `@doc` hook): `Invalid use of @view macro` on plain, valid
+    `@view x[2:end]` slices — only in that module-load context. Plain slices (`x[2:end]`,
+    `vcat(x[1:2], y)`) cost a copy on these small vectors and compile everywhere; left that
+    way (not chased further).
+
+### 8.19 Outline collapse/expand (2026-11-03)
+
+Groups collapse and expand in the outline: **the square in front of a group is the toggle** —
+`[-]` expanded, `[+]` collapsed (a text glyph inside the 10 px square mark; shape rows keep
+their layer-coloured square). Clicking the toggle zone — everything left of a group row's
+name (`x < 25 + depth*14` in the row's local coords, the indent gutter plus the square) —
+flips the group without touching the selection; clicking right of it selects as before.
+**Groups with 5+ members start collapsed**, small ones expanded, so a fresh import presents
+its structure (`plate.dxf → engraving [+]`) instead of hundreds of rows. The state is panel
+state (`@use Observable(Dict{UInt,Bool}())` keyed by group id, user clicks only — the default
+recomputes from the member count): renaming keeps the state, regrouping (new ids) resets to
+the default, and a collapsed group's members are simply not walked — `row_order` (and with it
+Shift-ranges) sees only visible rows, hidden members stay selected in the workspace.
+
+**Gotchas of this round**:
+
+60. **A rebuilt row carries no rect until the window is re-drawn** — after a toggle the
+    outline re-renders and the member rows are new fibers; a test that clicks a fresh row
+    right after `drain_events!/flush_dirty!/run_effects!` hits a fiber whose `rect` is still
+    `(0,0,0,0)` (the click lands at window (0,0) — the File menu). The real event flow is
+    fine (hits resolve by position over the laid-out tree); tests must `sync_windows!` +
+    `draw_window!` after any re-render before `find_fiber`+`click!`.
+61. **`group_arts` appends the new group last** — in a doc of 7 entries, grouping members
+    `[1..5]` puts Group 1 at index 8 and a second group over `[6,7]` at index 9: the member
+    indices are pre-append positions, the group indices post-append. Test docs built by
+    chained `group_arts` calls must count both.

@@ -23,15 +23,30 @@
 const SHELL_WIDTH = 1100
 const SHELL_HEIGHT = 700
 
+# The maximum number of entries the status summary lists before folding the
+# rest into an ellipsis.
+const SUMMARY_MAX_PARTS = 8
+
 "A one-line summary for the status bar, e.g. `unicorn.svg: 37 outlines`.
-Group entries hold no geometry of their own (their members are listed by
-their own files) — the summary counts shapes only."
+Top-level groups show as `name (N primitives)` — the full tree lives in the
+outline tab; a long document folds into `… (N more)`."
 function doc_summary(objs::AbstractVector{ArtObject})
-    shapes = [obj for obj in objs if !is_group(obj)]
-    isempty(shapes) && return "no design imported — use File → Open…"
-    parts = [string(obj.name, ": ", length(obj.paths),
-                    length(obj.paths) == 1 ? " outline" : " outlines")
-             for obj in shapes]
+    isempty(objs) && return "no design imported — use File → Open…"
+    parts = String[]
+    for (i, obj) in enumerate(objs)
+        if is_group(obj)
+            n = length(leaves_of(objs, i))
+            push!(parts, string(obj.name, " (", n, " primitives)"))
+        else
+            push!(parts, string(obj.name, ": ", length(obj.paths),
+                                length(obj.paths) == 1 ? " outline" : " outlines"))
+        end
+    end
+    if length(parts) > SUMMARY_MAX_PARTS
+        extra = length(parts) - SUMMARY_MAX_PARTS
+        parts = vcat(parts[1:SUMMARY_MAX_PARTS],
+                     [string("… (", extra, " more)")])
+    end
     return join(parts, "   ·   ")
 end
 
@@ -524,7 +539,7 @@ end
 function App(; doc = nothing, selection = nothing, origin = nothing, lock = nothing,
              active_layer = nothing, processes = nothing,
              editor_open = nothing, edit_layer = nothing, tool = nothing,
-             panel_tab = nothing, ctx_open = nothing)
+             panel_tab = nothing, ctx_open = nothing, anchor = nothing)
     # Hook state: every chunk of state the shell owns must survive re-renders
     # — plain `Observable(...)` locals are re-created whenever the shell
     # re-runs (any click re-renders the whole tree), so callbacks would write
@@ -563,6 +578,10 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
     # tests.
     ctx_open_internal = @use Observable(false)
     ctx_open = ctx_open === nothing ? ctx_open_internal : ctx_open
+    # The outline's range anchor (Shift+click): the doc index of the last
+    # plain-/Ctrl-clicked row. Injectable for tests like `ctx_open`.
+    anchor_internal = @use Observable{Union{Nothing,Int}}(nothing)
+    anchor = anchor === nothing ? anchor_internal : anchor
     # The workspace/panel split: LightBurn's right dock starts out ~80% of
     # the window; the handle is draggable.
     split_ratio = @use Observable(0.78)
@@ -661,7 +680,9 @@ function App(; doc = nothing, selection = nothing, origin = nothing, lock = noth
                                                        fill = true;
                                                        flex = 1)),
                                 (@rock OutlinePanel(doc = doc,
-                                                    selection = selection;
+                                                    selection = selection,
+                                                    ctx_open = ctx_open,
+                                                    anchor = anchor;
                                                     fill = true, flex = 1)),
                             ];
                             flex = 1, fill = true));

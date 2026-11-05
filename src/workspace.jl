@@ -189,6 +189,34 @@ function hit_shape(m, doc, x, y, threshold)
 end
 
 """
+    projected_segments(segs, m, color, width) -> Vector{Tuple}
+
+World-space segments projected through the camera matrix into canvas-local
+pixels — `(x1, y1, x2, y2, color, width)` tuples for `ctx.lines`. Segments
+that are axis-aligned on screen snap to whole pixels: a crisp grid line (the
+feather ramps stay within the nominal width).
+"""
+function projected_segments(segs, m, color, width)
+    T = Tuple{Float64,Float64,Float64,Float64,typeof(color),Float64}
+    out = T[]
+    for (a, b) in segs
+        p1 = apply(m, a)
+        p2 = apply(m, b)
+        if p1[1] == p2[1]                     # vertical on screen
+            x = round(p1[1])
+            p1 = SVector(x, p1[2])
+            p2 = SVector(x, p2[2])
+        elseif p1[2] == p2[2]                 # horizontal on screen
+            y = round(p1[2])
+            p1 = SVector(p1[1], y)
+            p2 = SVector(p2[1], y)
+        end
+        push!(out, (p1[1], p1[2], p2[1], p2[2], color, width))
+    end
+    return out
+end
+
+"""
     stroke_segments(obj, m) -> Vector{Tuple}
 
 The anti-aliased stroke segments of one document entry, projected through
@@ -468,22 +496,21 @@ function draw_workspace(ctx, camera, doc, selection, dash_phase;
     ctx.polygon(corners; color = (0.94, 0.95, 0.96))
 
     # The grid: 10 mm minors (thin) and 100 mm majors (thicker) — one
-    # geometry call for all of them, cached under the camera instance (a
-    # still camera re-issues the cached buffers, no rebuild).
+    # geometry call for all of them, projected through the camera matrix and
+    # cached under the camera instance (a still camera re-issues the cached
+    # buffers, no rebuild).
     minor = (0.86, 0.87, 0.90)
     major = (0.78, 0.81, 0.84)
     ctx.lines(:grid; deps = (camera,),
               build = () -> Iterators.flatten((
-                  ((a[1], a[2], b[1], b[2], minor, 1.0)
-                   for (a, b) in GRID_SEGMENTS.minor),
-                  ((a[1], a[2], b[1], b[2], major, 2.0)
-                   for (a, b) in GRID_SEGMENTS.major))))
+                  projected_segments(GRID_SEGMENTS.minor, m, minor, 1.0),
+                  projected_segments(GRID_SEGMENTS.major, m, major, 2.0))))
 
     # The bed border doubles as the work-origin axes through (0, 0) — cached
     # under the camera like the grid.
     ctx.lines(:bed; deps = (camera,),
-              build = () -> ((a[1], a[2], b[1], b[2], (0.55, 0.60, 0.65), 1.0)
-                             for (a, b) in BED_SEGMENTS))
+              build = () -> projected_segments(BED_SEGMENTS, m,
+                                               (0.55, 0.60, 0.65), 1.0))
 
     # Scan-mode layers paint their region fill first: the strokes still read
     # on top, and same-layer overlaps erase through the even-odd rule.

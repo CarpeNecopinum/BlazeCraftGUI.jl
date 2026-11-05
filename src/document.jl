@@ -218,6 +218,77 @@ function art_bounds(doc::AbstractVector{ArtObject}, idx::Int)
 end
 
 """
+    holder_group(doc, id) -> Union{Int,Nothing}
+
+The doc index of the group whose `children` holds id `id` — the membership
+link that shows the entry indented under that group in the outline — or
+`nothing` for a top-level entry.
+
+    ancestor_chain(doc, id) -> Vector{UInt}
+
+The ids of the groups along id's ancestor chain, innermost first (held with
+a seen guard so a hand-built cyclic document cannot spin).
+"""
+function holder_group(doc::AbstractVector{ArtObject}, id::UInt)
+    for (i, a) in enumerate(doc)
+        is_group(a) && id in a.children && return i
+    end
+    return nothing
+end
+
+function ancestor_chain(doc::AbstractVector{ArtObject}, id::UInt)
+    chain = UInt[]
+    seen = Set{UInt}([id])
+    while true
+        h = holder_group(doc, id)
+        h === nothing && break
+        push!(chain, doc[h].id)
+        doc[h].id in seen && break
+        push!(seen, doc[h].id)
+        id = doc[h].id
+    end
+    return chain
+end
+
+"""
+    common_group(doc, ids) -> Union{UInt,Nothing}
+
+The id of the innermost group that lies in every id's ancestor chain — the
+group a new group over these ids belongs in (None when some id is top
+level, i.e. no group covers them all).
+"""
+function common_group(doc::AbstractVector{ArtObject}, ids)
+    isempty(ids) && return nothing
+    sets = [Set(ancestor_chain(doc, id)) for id in ids]
+    for g in ancestor_chain(doc, ids[1])
+        all(s -> g in s, sets) && return g
+    end
+    return nothing
+end
+
+"""
+    prune_empty_groups(doc) -> doc
+
+Drop every group entry that holds no members — a group emptied by
+regrouping has no representation (LightBurn behaviour) — and strip the
+dangling references to the dropped nodes; recurses until stable so a chain
+of emptied groups goes too.
+"""
+function prune_empty_groups(doc::AbstractVector{ArtObject})
+    out = doc
+    while true
+        gone = Set(UInt(a.id) for a in out if is_group(a) && isempty(a.children))
+        isempty(gone) && break
+        out = [a for a in out if !(is_group(a) && a.id in gone)]
+        out = [is_group(a) ?
+               ArtObject(a; children = UInt[c for c in a.children
+                                              if !(c in gone)]) : a
+               for a in out]
+    end
+    return out
+end
+
+"""
     group_arts(doc, indices) -> doc
 
 Wrap the entries at `indices` — a mix of shapes and groups: grouping a
@@ -225,13 +296,47 @@ group into a group (or into a group with shapes) is how nesting is built —
 into a new group appended to the document. Membership is by id, so the
 members keep their doc entries and nothing else moves. Returns the new
 document vector (the group is its last entry; index `length(doc)`).
+
+Placement: the new group goes into the **innermost common group** of all
+members when they share one (grouping members of a group keeps the result
+inside it — LightBurn levels), at the top level otherwise. The members
+leave their previous holders at the same time — an entry is listed under
+its group *and* the new group must not claim it twice (the outline would
+duplicate the row). Members nested inside other selected members don't
+join (a group and its own members aren't wrapped both). Groups emptied by
+the move drop out.
 """
-function group_arts(doc::AbstractVector{ArtObject}, indices::AbstractVector{Int})
-    members = UInt[doc[i].id for i in indices if 1 <= i <= length(doc)]
-    isempty(members) && return doc
-    name = string("Group ", count(is_group, doc) + 1)
-    return vcat(doc, [ArtObject(art_next_id(), :group, name,
-                                PolyLine[], 0, members)])
+function group_arts(doc::AbstractVector{ArtObject}, indices::AbstractVector{Int};
+                    name = nothing)
+    idxs = unique(filter(i -> 1 <= i <= length(doc), collect(indices)))
+    member_ids = UInt[doc[i].id for i in idxs]
+    memberset = Set(member_ids)
+    # A member nested inside another member stays put (its ancestor joins
+    # the new group and carries the subtree along).
+    idxs = [i for i in idxs if !any(g in memberset
+                                    for g in ancestor_chain(doc, doc[i].id))]
+    isempty(idxs) && return doc
+    member_ids = UInt[doc[i].id for i in idxs]
+    memberset = Set(member_ids)
+    label = name === nothing ? string("Group ", count(is_group, doc) + 1) :
+            string(name)
+    newgroup = ArtObject(art_next_id(), :group, label,
+                         PolyLine[], 0, member_ids)
+    inner = common_group(doc, member_ids)
+    out = ArtObject[]
+    for a in doc
+        if is_group(a) && !isempty(intersect(a.children, memberset))
+            # The group releases every member it held; the innermost
+            # common group additionally adopts the new group afterwards.
+            kids = UInt[c for c in a.children if !(c in memberset)]
+            a.id == inner && push!(kids, newgroup.id)
+            push!(out, ArtObject(a; children = kids))
+        else
+            push!(out, a)
+        end
+    end
+    push!(out, newgroup)
+    return prune_empty_groups(out)
 end
 
 """
@@ -313,44 +418,81 @@ end
 """
     import_art(path) -> Vector{ArtObject}
 
-Read a design file and return its art as flattened `PolyLine`s (millimetres,
-y-up), one `ArtObject` per source layer. SVG carries no layer information —
-a single object on the default layer; a DXF's layer names each become their
-own object on successive palette layers (sorted by name, `00` on). Anything
-else is rejected with an error the caller turns into a status message.
+Read a design file and return its art: **one `ArtObject` per primitive**
+(each flattened `PolyLine`, millimetres, y-up) with a **group entry around
+the whole file's contents** named after the file — a single-primitive file
+imports as-is, no group. SVG carries no layer information — every primitive
+lands on the default layer. A DXF's own containers build the tree's middle
+level (`file → unit → shapes`): each layer becomes its own palette layer
+(sorted by name, `00` on) and a `file/layer` subgroup; `INSERT` block
+instances explode into `file/blockname` subgroups (transforms applied,
+`MINSERT` arrays as one unit) and `ACAD_GROUP` objects keep their name; the
+contour weld chains endpoint-sharing primitives into one shape each (the
+8 arcs of a rounded plate arrive as one closed shape), so a 430-primitive
+drawing presents as
+`plate.dxf → cut 1 (shape), engraving (48 shapes)`. Any unit with
+one shape skips its extra level. Anything else is rejected with an
+error the caller turns into a status message.
 """
 function import_art(path::AbstractString)
     isfile(path) || error("file not found: \"$path\"")
     ext = lowercase(splitext(path)[2])
     base = basename(path)
-    arts = ArtObject[]
-    paths = PolyLine[]
+    arts = ArtObject[]                     # the file's primitives
     if ext == ".svg"
         # SVG is authored y-down; the importer's flip_y default maps it into
         # laser coords (y-up), which is what the workspace displays. SVG has
         # no layer concept in our importer — everything lands on layer `00`.
-        push!(paths, flatten(BlazeCraft.Importers.load_svg(read(path, String)))...)
-    elseif ext == ".dxf"
-        layers = open(path) do io
-            instructions = BlazeCraft.Importers.load_dxf_instructions(io)
-            BlazeCraft.Importers.extract_polys(instructions)
+        paths = flatten(BlazeCraft.Importers.load_svg(read(path, String)))
+        isempty(paths) && error("no supported geometry found in \"$path\"")
+        for (i, pl) in enumerate(paths)
+            push!(arts, ArtObject(string(base, ' ', i), [pl], DEFAULT_LAYER))
         end
-        isempty(layers) && error("no supported geometry found in \"$path\"")
+    elseif ext == ".dxf"
+        instructions = open(path) do io
+            BlazeCraft.Importers.load_dxf_instructions(io)
+        end
+        units = BlazeCraft.Importers.extract_structured(instructions)
+        isempty(units) && error("no supported geometry found in \"$path\"")
         # One palette layer per DXF layer (sorted by name, `00` on; past the
-        # 30 cut layers the assignment wraps around).
-        for (i, lname) in enumerate(sort!(collect(keys(layers))))
-            paths = flatten(layers[lname])
-            isempty(paths) && continue
-            push!(arts, ArtObject(string(base, '/', lname), paths,
-                                  mod(i - 1, CUT_LAYERS)))
+        # 30 cut layers the assignment wraps around), assigned per primitive.
+        used = sort!(unique([l for u in units for l in u.poly_layers]))
+        palette_of = Dict(n => mod(i - 1, CUT_LAYERS)
+                          for (i, n) in enumerate(used))
+        # The units build the tree's middle level: layer buckets first
+        # (the palette structure), then block instances / named groups in
+        # file order (the CAD author's own containers). A repeated
+        # container name (two instances of one block) gets ` #k`.
+        seen_names = Dict{String,Int}()
+        ordered = vcat(sort!([u for u in units if u.kind === :layer];
+                              by = u -> u.name),
+                       [u for u in units if u.kind !== :layer])
+        for u in ordered
+            repeat = u.kind === :layer ? 0 :
+                     get!(seen_names, u.name, 0) + 1
+            u.kind !== :layer && (seen_names[u.name] = repeat)
+            label = repeat > 1 ? string(base, '/', u.name, " #", repeat) :
+                    string(base, '/', u.name)
+            idxs = Int[]
+            for (j, pl) in enumerate(u.polys)
+                push!(arts, ArtObject(string(label, ' ', j), [pl],
+                                      palette_of[u.poly_layers[j]]))
+                push!(idxs, length(arts))
+            end
+            # A multi-primitive unit becomes its own group: a layer that is
+            # the DXF's own grouping, a block instance or named group the
+            # container the file's own structure implies — the outline
+            # shows `file → unit → shapes` instead of hundreds of rows.
+            length(idxs) > 1 && (arts = group_arts(arts, idxs; name = label))
         end
         isempty(arts) && error("no geometry found in \"$path\"")
-        return arts
     else
         error("unsupported design format \"$ext\" (supported: .svg, .dxf)")
     end
-    isempty(paths) && error("no geometry found in \"$path\"")
-    return [ArtObject(base, paths, DEFAULT_LAYER)]
+    # A group around the whole file's contents; a single primitive imports
+    # as-is (no group around one entry).
+    length(arts) <= 1 && return arts
+    return group_arts(arts, eachindex(arts); name = base)
 end
 
 """

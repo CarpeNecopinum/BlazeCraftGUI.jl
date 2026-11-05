@@ -5,29 +5,92 @@ using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
                     translate, scale, rotate, hit_shape,
                     selection_handles, selection_union_bbox, shapes_in_rect,
-                    layer_color, ArtObject
+                    layer_color, ArtObject, resolve_leaves, is_group
 using BlazeCraft.Shapes: PolyLine, Point
 using StaticArrays: SVector
 
 @testset "document model" begin
     @testset "import_art: svg" begin
-        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
-        @test art.name == "shapes.svg"
-        # SVG carries no layer information: everything on the default layer.
-        @test art.layer == 0
-        @test length(art.paths) == 3
+        arts = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        # One entry per primitive, plus a group around the whole file
+        # (named after the file).
+        @test length(arts) == 4
+        g = arts[4]
+        @test is_group(g)
+        @test g.name == "shapes.svg"
+        @test g.children == UInt64[a.id for a in arts[1:3]]
+        # The primitives: one flattened outline each, named "file N".
+        @test [a.name for a in arts[1:3]] ==
+              ["shapes.svg 1", "shapes.svg 2", "shapes.svg 3"]
+        @test all(a -> a.layer == 0, arts[1:3])
+        @test sum(length(a.paths) for a in arts[1:3]) == 3
         # Coordinates are millimetres, y-up (importer flips SVG's y-down).
-        ys = [p[2] for pl in art.paths for p in pl.points]
+        ys = [p[2] for a in arts[1:3] for pl in a.paths for p in pl.points]
         @test maximum(ys) <= 0  # the file sits below the origin after the flip
+        # Resolving the group covers all three primitives.
+        @test resolve_leaves(arts, [4]) == [1, 2, 3]
     end
 
-    @testset "import_art: dxf layers split" begin
+    @testset "import_art: dxf container units" begin
+        # A layer bucket, two INSERT instances of one block and a named
+        # group holding both instances (assets/blocks_groups.dxf). The
+        # members list under *their* container only.
+        arts = import_art(joinpath(@__DIR__, "assets", "blocks_groups.dxf"))
+        file_group = arts[end]
+        @test is_group(file_group) && file_group.name == "blocks_groups.dxf"
+        containers = [a for a in arts[1:end-1] if is_group(a)]
+        prims = [a for a in arts[1:end-1] if !is_group(a)]
+        @test length(containers) == 1
+        @test containers[1].name == "blocks_groups.dxf/Fasteners"
+        # The group holds both exploded INSERTs (4 primitives: 2 lines +
+        # 2 flattened circles); the lone layer entity stays directly in
+        # the file group.
+        @test resolve_leaves(arts, [art_index(arts, containers[1].id)]) ==
+              [2, 3, 4, 5]
+        @test length(prims) == 5
+        @test [a.name for a in prims] == [
+            "blocks_groups.dxf/cut 1",
+            "blocks_groups.dxf/Fasteners 1", "blocks_groups.dxf/Fasteners 2",
+            "blocks_groups.dxf/Fasteners 3", "blocks_groups.dxf/Fasteners 4"]
+        # The whole file resolves every primitive exactly once.
+        @test resolve_leaves(arts, [length(arts)]) == collect(1:5)
+        # Palette layers per DXF layer, sorted by name: cut 00, fastener 01.
+        @test prims[1].layer == 0
+        @test all(a -> a.layer == 1, prims[2:5])
+        # Exploded placement: the first bolt sits at (100, 200) — insertion
+        # point + 2x scale + 90° rotation — the second at (300, 200) plain.
+        (pmin, pmax) = document_bounds([prims[2]])
+        @test pmin[1] <= 100 <= pmax[1] && pmin[2] <= 200 <= pmax[2]
+        (pmin, pmax) = document_bounds([prims[4]])
+        @test pmin[1] <= 300 <= pmax[1] && pmin[2] <= 200 <= pmax[2]
+    end
+
+    @testset "import_art: dxf layers pre-group" begin
+        # example.dxf (same drawing as the manual-test plate.dxf): 430
+        # entities on the layers `cut`/`engraving`, no blocks/groups — the
+        # DXF layers build the tree, and the contour weld chains the
+        # endpoint-sharing primitives: the 8 cut arcs become ONE closed
+        # shape, the engraving's 422 primitives weld into 48 shapes.
         arts = import_art(joinpath(@__DIR__, "..", "example.dxf"))
-        @test length(arts) >= 2
-        # One palette layer per DXF source layer, assigned in sorted name
-        # order (`00` on), named "file/layer".
-        @test [a.layer for a in arts] == collect(0:length(arts) - 1)
-        @test all(a -> occursin('/', a.name), arts)
+        @test length(arts) == 51   # 1 cut + 48 engraving shapes + engraving
+        #                              group + file group
+        file_group = arts[end]
+        @test is_group(file_group) && file_group.name == "example.dxf"
+        @test !occursin('/', file_group.name)
+        layer_groups = [a for a in arts[1:end-1] if is_group(a)]
+        @test [a.name for a in layer_groups] == ["example.dxf/engraving"]
+        eng = resolve_leaves(arts, [art_index(arts, layer_groups[1].id)])
+        @test length(eng) == 48 && all(i -> arts[i].layer == 1, eng)
+        # The cut shape: welded to one closed poly, directly under the
+        # file group (single-shape units skip their group level).
+        cut = [i for i in eachindex(arts) if !is_group(arts[i]) &&
+                                           arts[i].layer == 0]
+        @test length(cut) == 1 && arts[cut[1]].name == "example.dxf/cut 1"
+        @test length(arts[cut[1]].paths) == 1 && arts[cut[1]].paths[1].closed
+        # The file resolves its shapes exactly once.
+        leaves = resolve_leaves(arts, [length(arts)])
+        @test length(leaves) == 49 && length(unique(leaves)) == 49
+        @test all(a -> !is_group(a), [arts[i] for i in leaves])
     end
 
     @testset "import_art: errors" begin
@@ -37,8 +100,9 @@ using StaticArrays: SVector
 
     @testset "document_bounds" begin
         @test document_bounds(ArtObject[]) === nothing
-        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
-        b = document_bounds([art])
+        arts = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        # The group entry holds no geometry; the bounds come from the shapes.
+        b = document_bounds(arts)
         @test b !== nothing
         (pmin, pmax) = b
         @test pmin[1] < pmax[1] && pmin[2] < pmax[2]
@@ -54,17 +118,19 @@ using StaticArrays: SVector
 
     @testset "doc_summary" begin
         @test occursin("File", doc_summary(ArtObject[]))
-        art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
-        @test doc_summary([art]) == "shapes.svg: 3 outlines"
+        arts = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+        # Groups hold no geometry of their own — the summary counts shapes.
+        @test occursin("shapes.svg 1: 1 outline", doc_summary(arts))
+        @test !occursin("Group", doc_summary(arts))
     end
 
     @testset "center_on_workarea" begin
         @testset "single object centers its bounds on the work area" begin
-            art = only(import_art(joinpath(@__DIR__, "assets", "shapes.svg")))
-            (pmin, pmax) = document_bounds([art])
+            arts = import_art(joinpath(@__DIR__, "assets", "shapes.svg"))
+            (pmin, pmax) = document_bounds(arts)
             before_w = pmax[1] - pmin[1]
             before_h = pmax[2] - pmin[2]
-            centered = center_on_workarea([art])
+            centered = center_on_workarea(arts)
             (pmin, pmax) = document_bounds(centered)
             # The union center sits on the work-area center (150, 150).
             @test (pmin[1] + pmax[1]) / 2 ≈ 150.0
@@ -72,6 +138,9 @@ using StaticArrays: SVector
             # The geometry is only translated, not scaled.
             @test pmax[1] - pmin[1] ≈ before_w
             @test pmax[2] - pmin[2] ≈ before_h
+            # The import's group survives the translation (identity kept).
+            @test is_group(centered[end])
+            @test centered[end].name == "shapes.svg"
         end
 
         @testset "multiple objects center together, keeping relative positions" begin
@@ -1189,6 +1258,49 @@ end
         @test outer.children == UInt64[g.id, c.id]
     end
 
+    @testset "group_arts: placement in the innermost common group" begin
+        # Regrouping the members of an existing group nests the new group
+        # INSIDE it — and the members leave their old holder, so the
+        # outline lists them under the new group only (no duplication).
+        d = group_arts([a, b, c], [1, 2])       # [a, b, c, Group 1(a, b)]
+        d2 = group_arts(d, [1, 2])
+        @test length(d2) == 5
+        inner, outer = d2[5], d2[4]
+        @test is_group(inner) && inner.name == "Group 2"
+        @test inner.children == UInt64[a.id, b.id]
+        # The common group adopted the new group; the members left it.
+        @test outer.children == UInt64[inner.id]
+        @test top_level_indices(d2) == [3, 4]
+        # Each shape walks exactly once under the subtree.
+        @test leaves_of(d2, 4) == [1, 2]
+        # No common group (a member is top level): the new group lands
+        # there and still pulls the members out of their holders — an
+        # emptied holder drops out entirely.
+        d3 = group_arts(group_arts([a, b, c], [2]), [2, 1])
+        # [a, b, c, Group 1(b)] -> group a + b: no common group; Group 1
+        # releases its only member and is pruned.
+        @test length(d3) == 4                   # Group 1 emptied and pruned
+        regroup = d3[4]
+        @test is_group(regroup)
+        @test sort(regroup.children) == sort(UInt64[a.id, b.id])
+        @test top_level_indices(d3) == [3, 4]
+        # A member nested inside another member doesn't join twice: grouping
+        # Group 1 + its own member a wraps Group 1 alone (the descendant
+        # drops out — its ancestor carries the subtree along).
+        d4 = group_arts(d, [4, 1])              # Group 1 + its own member a
+        @test length(d4) == 5
+        newg = d4[5]
+        inner_id = d[4].id
+        @test newg.children == UInt64[inner_id]
+        # The wrapper is top level; Group 1 now belongs to it.
+        @test top_level_indices(d4) == [3, 5]
+        # Unrelated: helper sanity for tests
+        @test holder_group(d2, a.id) == 5       # a now sits in Group 2
+        @test common_group(d2, UInt[a.id, b.id]) == inner.id
+        @test common_group(d2, UInt[a.id, c.id]) === nothing
+        @test ancestor_chain(d2, a.id) == UInt64[inner.id, outer.id]
+    end
+
     @testset "resolve_leaves / parent_group / top_level_indices" begin
         d = group_arts([a, b, c], [1, 2])
         d2 = group_arts(d, [4, 3])
@@ -1281,7 +1393,8 @@ end
     @testset "summary and layers skip groups" begin
         d = group_arts([a, b, c], [1, 2])
         @test occursin("a: 1 outline", doc_summary(d))
-        @test !occursin("Group 1", doc_summary(d))
+        # Top-level groups show with their primitive counts.
+        @test occursin("Group 1 (2 primitives)", doc_summary(d))
         @test document_layers(d) == [0, 1, 2]
     end
 end
@@ -1695,5 +1808,410 @@ end
         Rocks.flush_dirty!()
         Rocks.run_effects!()
         @test selection[] == [3]
+    end
+end
+
+@testset "outline: shift-click multiselects a row range" begin
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    anchor = Observable{Union{Nothing,Int}}(nothing)
+    panel_tab = Observable(2)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+             ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+             ArtObject("gamma", [ring(210.0, 100.0, 260.0, 140.0)], 1),
+             ArtObject("delta", [ring(10.0, 260.0, 30.0, 280.0)], 1)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab, anchor = anchor)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        sync() = begin
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        shift_click(f) = begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              mod = 0x0001)   # left button, Shift held
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              mod = 0x0001)
+            sync()
+        end
+
+        # The anchor seats on a plain click; Shift+click selects the range
+        # from it to the clicked row (visible row order), replacing what
+        # was selected.
+        Rocks.click!(row(main, "alpha"))
+        sync()
+        @test selection[] == [1]
+        shift_click(row(main, "gamma"))
+        @test selection[] == [1, 2, 3]
+        # The anchor stays at alpha — the range grows from there.
+        shift_click(row(main, "delta"))
+        @test selection[] == [1, 2, 3, 4]
+        # Shift+click after a Ctrl-click ranges from the Ctrl-clicked row.
+        ctrl = (f) -> begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              mod = 0x0040)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              mod = 0x0040)
+            sync()
+        end
+        ctrl(row(main, "beta"))
+        @test sort(selection[]) == [1, 3, 4]     # beta toggled out
+        shift_click(row(main, "delta"))
+        @test selection[] == [2, 3, 4]           # beta..delta, anchor moved
+        # A plain click collapse back still works after range selections.
+        Rocks.click!(row(main, "gamma"))
+        sync()
+        @test selection[] == [3]
+    end
+end
+
+@testset "outline: subgroups list at the top of their super-group" begin
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(2)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    # Group 1 over s1+s2+s3, then a subgroup Group 2 around s3 INSIDE it.
+    doc[] = group_arts(group_arts(
+        [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+         ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+         ArtObject("sq", [ring(210.0, 100.0, 260.0, 140.0)], 1),
+         ArtObject("tri", [ring(10.0, 260.0, 30.0, 280.0)], 1),
+         ArtObject("hex", [ring(60.0, 260.0, 80.0, 280.0)], 1)],
+        [3, 4, 5]), [5])
+    # [alpha, beta, sq, tri, hex, Group 1(sq, tri, hex), Group 2(hex)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        labels(f, acc = String[]) = begin
+            f.kind === Rocks.Text &&
+                append!(acc, string.(get(f.props, :children, ())))
+            foreach(c -> labels(c, acc), f.children)
+            acc
+        end
+        names = labels(main)
+        seq = [n for n in names if
+               n in ("alpha", "beta", "sq", "tri", "hex",
+                     "Group 1", "Group 2")]
+        # The outermost groups first, then their subgroups (containers at
+        # the top of their parent), then the plain shapes of the group, in
+        # doc order; the top-level shapes trail. Group 2 wraps hex but
+        # shows only under Group 1.
+        @test seq == ["Group 1", "Group 2", "hex", "sq", "tri",
+                      "alpha", "beta"]
+    end
+end
+
+@testset "outline: regrouping members does not duplicate rows" begin
+    # Grouping the members of an existing group through the outline's
+    # context menu: the new group nests INSIDE the common group and each
+    # member lists exactly once (Group 2 under Group 1, members under
+    # Group 2 — the pre-fix behaviour claimed them for both nodes).
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(2)
+    ctx_open = Observable(false)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts([ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+                        ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+                        ArtObject("gamma", [ring(210.0, 100.0, 260.0, 140.0)], 1)],
+                       [1, 2])
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab,
+                              ctx_open = ctx_open)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        item(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        labels(f, acc = String[]) = begin
+            f.kind === Rocks.Text &&
+                append!(acc, string.(get(f.props, :children, ())))
+            foreach(c -> labels(c, acc), f.children)
+            acc
+        end
+        sync() = begin
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+        ctrl_click(f) = begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              mod = 0x0040)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              mod = 0x0040)
+            sync()
+        end
+        right_click(f) = begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              button = 3)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              button = 3)
+            sync()
+        end
+        rownames() = begin
+            names = labels(main)
+            [n for n in names if
+             n in ("alpha", "beta", "gamma", "Group 1", "Group 2")]
+        end
+
+        # Before: the members under their group once each.
+        @test rownames() == ["Group 1", "alpha", "beta", "gamma"]
+
+        ctrl_click(row(main, "alpha"))
+        ctrl_click(row(main, "beta"))
+        right_click(row(main, "alpha"))
+        windows = Rocks.sync_windows!(root)
+        popup = only(filter(w -> Bool(get(w.props, :popup, false)), windows))
+        Rocks.click!(item(popup, "Group"))
+        sync()
+
+        # After: Group 2 nested inside Group 1 (subgroup top), members only
+        # under Group 2 — no top-level copies.
+        @test rownames() == ["Group 1", "Group 2", "alpha", "beta", "gamma"]
+        d = doc[]
+        @test d[4].children == UInt64[d[5].id]   # Group 1 holds Group 2
+        @test d[5].children == UInt64[d[1].id, d[2].id]   # the members
+        @test top_level_indices(d) == [3, 4]     # nothing duplicated
+    end
+end
+
+@testset "outline: groups collapse and expand" begin
+    # The square in front of a group is the toggle: `[-]` expanded, `[+]`
+    # collapsed. Groups with 5+ members start collapsed, small ones start
+    # expanded; a collapsed group's members are not listed. Square clicks
+    # never change the selection.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(2)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    # A 5-member group (pre-collapsed by size) and a 2-member group.
+    big = [ArtObject("m$i", [ring(10.0 * i, 100.0, 10.0 * i + 8, 140.0)], 1)
+           for i in 1:5]
+    small = [ArtObject("alpha", [ring(100.0, 200.0, 140.0, 240.0)], 0),
+             ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2)]
+    doc[] = group_arts(group_arts(vcat(big, small), collect(1:5)), [6, 7])
+    # [m1..m5, alpha, beta, Group 1(m1..m5), Group 2(alpha, beta)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        labels(f, acc = String[]) = begin
+            f.kind === Rocks.Text &&
+                append!(acc, string.(get(f.props, :children, ())))
+            foreach(c -> labels(c, acc), f.children)
+            acc
+        end
+        rownames() = begin
+            names = labels(main)
+            [n for n in names if
+             n in ("m1", "m2", "m3", "m4", "m5", "alpha", "beta",
+                   "Group 1", "Group 2")]
+        end
+        toggle_square(f) = Rocks.click!(f; at = (12.0, 12.0))  # the square
+        sync() = begin
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+            # a toggle rebuilds the rows: re-sync windows and re-draw so
+            # the fresh rows carry their laid-out rects
+            wins = Rocks.sync_windows!(root)
+            main = wins[findfirst(
+                w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, wins)]
+            Rocks.draw_window!(main)
+        end
+
+        # The big group starts collapsed (5 members), the small one starts
+        # expanded.
+        @test rownames() == ["Group 1", "Group 2", "alpha", "beta"]
+
+        # Clicking the square expands the group: the members list.
+        toggle_square(row(main, "Group 1"))
+        sync()
+        @test rownames() == ["Group 1", "m1", "m2", "m3", "m4", "m5",
+                             "Group 2", "alpha", "beta"]
+        @test selection[] == Int[]           # a square click never selects
+
+        # Clicking it again collapses; the members' rows disappear.
+        toggle_square(row(main, "Group 1"))
+        sync()
+        @test rownames() == ["Group 1", "Group 2", "alpha", "beta"]
+
+        # The small group toggles too.
+        toggle_square(row(main, "Group 2"))
+        sync()
+        @test rownames() == ["Group 1", "Group 2"]
+        toggle_square(row(main, "Group 2"))
+        sync()
+        @test rownames() == ["Group 1", "Group 2", "alpha", "beta"]
+
+        # The square keeps its state while the selection changes: a selected
+        # group toggles without losing the selection.
+        Rocks.click!(row(main, "Group 1"))
+        sync()
+        @test selection[] == [8]             # the group node (entry 8)
+        toggle_square(row(main, "Group 1"))
+        sync()
+        @test selection[] == [8]
+        @test rownames() == ["Group 1", "m1", "m2", "m3", "m4", "m5",
+                             "Group 2", "alpha", "beta"]
+
+        # A row click (not on the square) still selects exactly the entry.
+        Rocks.click!(row(main, "m3"))
+        sync()
+        @test selection[] == [3]
+    end
+end
+
+@testset "outline: right-click context menu" begin
+    # Right-clicking a row selects it (unless already selected) and opens
+    # the app's Group/Ungroup popup on it — Group wraps the selection,
+    # Ungroup dissolves the selected group one level.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    panel_tab = Observable(2)
+    ctx_open = Observable(false)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    doc[] = group_arts(group_arts(
+        [ArtObject("alpha", [ring(100.0, 100.0, 200.0, 160.0)], 0),
+         ArtObject("beta", [ring(40.0, 190.0, 140.0, 240.0)], 2),
+         ArtObject("gamma", [ring(210.0, 100.0, 260.0, 140.0)], 1)],
+        [1, 2]), [4, 3])
+    # [alpha, beta, gamma, Group 1(alpha, beta), Group 2(Group 1, gamma)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              panel_tab = panel_tab,
+                              ctx_open = ctx_open)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+
+        row(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        popups(wins) = filter(w -> Bool(get(w.props, :popup, false)), wins)
+        item(f, label) = Rocks.find_fiber(f) do fib
+            fib.kind === Rocks.Pressable &&
+                Rocks.find_by_label(fib, label) !== nothing
+        end
+        right_click(f) = begin
+            x, y = Rocks.fiber_center(f)
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_DOWN, x, y;
+                              button = 3)
+            Rocks.drain_events!()
+            Rocks.push_mouse!(f, SDL3.SDL_EVENT_MOUSE_BUTTON_UP, x, y;
+                              button = 3)
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+        end
+
+        # Right-click a shape row: selects it and opens the menu — Group is
+        # enabled, Ungroup is not (no group in the selection).
+        right_click(row(main, "alpha"))
+        @test ctx_open[]
+        @test selection[] == [1]
+        windows = Rocks.sync_windows!(root)
+        popup = only(popups(windows))
+        group_item = item(popup, "Group")
+        ungroup_item = item(popup, "Ungroup")
+        @test !Bool(get(group_item.props, :disabled, false))
+        @test Bool(get(ungroup_item.props, :disabled, false))
+
+        # Group through the outline's menu: the selection becomes the group.
+        Rocks.click!(group_item)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 6
+        @test is_group(doc[][6])
+        @test doc[][6].children == UInt64[doc[][1].id]
+        @test selection[] == [6]
+        windows = Rocks.sync_windows!(root)
+        @test isempty(popups(windows))
+
+        # Right-click the new group's row: Ungroup is enabled this time.
+        right_click(row(main, "Group 3"))
+        windows = Rocks.sync_windows!(root)
+        popup = only(popups(windows))
+        ungroup_item = item(popup, "Ungroup")
+        @test !Bool(get(ungroup_item.props, :disabled, false))
+        Rocks.click!(ungroup_item)
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 5
+        @test selection[] == [1]
+        windows = Rocks.sync_windows!(root)
+        @test isempty(popups(windows))
+
+        # Right-click an already-selected row inside a multi-selection: the
+        # selection survives (the menu acts on all of it).
+        selection[] = [1, 3]
+        right_click(row(main, "gamma"))
+        @test sort(selection[]) == [1, 3]
+        windows = Rocks.sync_windows!(root)
+        popup = only(popups(windows))
+        Rocks.click!(item(popup, "Group"))
+        Rocks.drain_events!()
+        Rocks.flush_dirty!()
+        Rocks.run_effects!()
+        @test length(doc[]) == 6
+        @test is_group(doc[][6])
+        @test sort(resolve_leaves(doc[], [6])) == [1, 3]
+        @test selection[] == [6]
     end
 end
