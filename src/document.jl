@@ -513,6 +513,75 @@ function rect_art(name::AbstractString, x0::Float64, y0::Float64,
 end
 
 """
+    root_bounds(doc, idx) -> (Point, Point)
+
+The bounding rectangle (millimetres, y-up) of one alignment root: the union
+of the resolved member leaves' bounds (a group's bounds come from its
+subtree, a shape's from its own paths); `nothing` without geometry.
+"""
+function root_bounds(doc::AbstractVector{ArtObject}, idx::Int)
+    bounds = nothing
+    for li in resolve_leaves(doc, [idx])
+        b = document_bounds([doc[li]])
+        b === nothing && continue
+        bounds = bounds === nothing ? b :
+                 (Point(min.(bounds[1], b[1])), Point(max.(bounds[2], b[2])))
+    end
+    return bounds
+end
+
+"""
+    align_arts(doc, selection; x = :none, y = :none) -> Vector{ArtObject}
+
+The alignment tools: each selected entry is one alignment **root** — a
+selected group is one root (its members move together), selected shapes are
+roots of their own (several members of one group selected together still
+move individually). The roots' overall bounding rectangle is the target;
+per axis (`:min`, `:center`, `:max` — `:none` keeps the axis) every root
+translates so its own bounding box's negative/centre/positive edge lands on
+the rectangle's edge/centre. One root alone is the rectangle — a no-op. A
+leaf claimed by an earlier root (a group and its own member both selected)
+does not move twice.
+"""
+function align_arts(doc::AbstractVector{ArtObject},
+                    selection::AbstractVector{Int};
+                    x::Symbol = :none, y::Symbol = :none)
+    roots = filter(i -> 1 <= i <= length(doc), selection)
+    isempty(roots) && return doc
+    (x in (:none, :min, :center, :max) &&
+     y in (:none, :min, :center, :max)) || return doc
+    bbs = Tuple{Point,Point}[]
+    for r in roots
+        b = root_bounds(doc, r)
+        b === nothing && return doc
+        push!(bbs, b)
+    end
+    pmin = Point(Inf, Inf)
+    pmax = Point(-Inf, -Inf)
+    for (a, b) in bbs
+        pmin = Point(min.(pmin, a))
+        pmax = Point(max.(pmax, b))
+    end
+    d = copy(doc)
+    claimed = UInt[]
+    for (r, b) in zip(roots, bbs)
+        dx = x == :none ? 0.0 :
+             x == :center ? (pmin[1] + pmax[1]) / 2 - (b[1][1] + b[2][1]) / 2 :
+             x == :max ? pmax[1] - b[2][1] : pmin[1] - b[1][1]
+        dy = y == :none ? 0.0 :
+             y == :center ? (pmin[2] + pmax[2]) / 2 - (b[1][2] + b[2][2]) / 2 :
+             y == :max ? pmax[2] - b[2][2] : pmin[2] - b[1][2]
+        (dx == 0.0 && dy == 0.0) && continue
+        for li in resolve_leaves(doc, [r])
+            d[li].id in claimed && continue
+            push!(claimed, d[li].id)
+            d[li] = translate(d[li], dx, dy)
+        end
+    end
+    return d
+end
+
+"""
     translate(art, dx, dy) -> ArtObject
 
 Move an art object by `dx`/`dy` millimetres.

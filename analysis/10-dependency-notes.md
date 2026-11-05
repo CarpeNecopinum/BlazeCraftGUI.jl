@@ -1515,3 +1515,35 @@ Shift-ranges) sees only visible rows, hidden members stay selected in the worksp
     `[1..5]` puts Group 1 at index 8 and a second group over `[6,7]` at index 9: the member
     indices are pre-append positions, the group indices post-append. Test docs built by
     chained `group_arts` calls must count both.
+
+### 8.20 Alignment tools (2026-11-05)
+
+The **top toolbar** gained the align family next to the placement inputs (origin grid, X/Y,
+W/H, lock, a separator): **6 buttons, 3 per axis**, each aligning at the negative, centre or
+positive edge of the selection's bounding rectangle (row 1: x axis left/centre/right, row 2:
+y axis top/centre/bottom in y-up world; raised-bevel `Mechanics.Button`s to match the
+toolbar). The model lives in `align_arts(doc, selection; x, y)` (`src/document.jl`): each
+selected entry is one alignment **root** — a directly selected group is one root (its members
+translate together, relative offsets preserved), selected shapes are roots of their own
+(several members of one group selected together still move individually). Per axis
+(`:min`/`:center`/`:max`, `:none` keeps it) every root translates so its own bounding box's
+edge/centre lands on the roots' rectangle's; one root alone *is* the rectangle — a no-op; a
+leaf claimed by an earlier root (a group and its own member both selected) never moves twice.
+The buttons gray out below two selected roots and write one `align_arts` result per click.
+
+**Gotchas of this round**:
+
+62. **`width = "100%"` buttons in a Row overflow their panel** — the first align grid gave
+    both columns "100%" of the Row and each measured 34 px wide: the right column landed at
+    x 41..75, outside the 44 px strip, where the workspace's hit-test swallowed the clicks
+    (the button *drew* — overflow `:visible` — but never received one). Fixed-size buttons
+    (16 px) keep both columns inside the strip; the same rule as the outline's fixed 10 px
+    chevron box.
+63. **MDI codepoints are off by a family** — the align icons are **F11C2–F11C7**
+    (`materialdesignicons.css` v7.4.47), not F00C1–F00C6 (which render bookmark glyphs —
+    plausible-looking, silently wrong). Verify icon codepoints against the shipped font's
+    CSS, or by screenshot, before trusting them.
+64. **Each align recomputes the rectangle** — the clicks compound: after x-min, the
+    rectangle's left edge is the aligned edge, so a following x-centre centres on the *new*
+    rectangle. Tests must chain expectations through the compound sequence (the per-click
+    math is pinned by the `align_arts` testset on fresh docs).

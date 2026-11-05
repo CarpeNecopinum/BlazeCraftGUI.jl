@@ -30,6 +30,13 @@ const MDI_GLYPHS = Dict{String,Char}(
     # creation tools
     "select" => Char(0xf01c0), "rectangle" => Char(0xf05c6),
     "delete" => Char(0xf01b4),
+    # align tools (3 per axis: negative/centre/positive edge)
+    "align-horizontal-left" => Char(0xf11c2),
+    "align-horizontal-center" => Char(0xf11c3),
+    "align-horizontal-right" => Char(0xf11c4),
+    "align-vertical-bottom" => Char(0xf11c5),
+    "align-vertical-center" => Char(0xf11c6),
+    "align-vertical-top" => Char(0xf11c7),
     # state toggles
     "lock" => Char(0xf033e), "lock-open" => Char(0xf033f),
 )

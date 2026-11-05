@@ -5,7 +5,8 @@ using BlazeCraftGUI: fit_camera, matrix, apply, zoom_at, pan, Camera,
                     doc_summary, document_bounds, center_on_workarea,
                     translate, scale, rotate, hit_shape,
                     selection_handles, selection_union_bbox, shapes_in_rect,
-                    layer_color, ArtObject, resolve_leaves, is_group
+                    layer_color, ArtObject, resolve_leaves, is_group,
+                    align_arts, group_arts
 using BlazeCraft.Shapes: PolyLine, Point
 using StaticArrays: SVector
 
@@ -368,8 +369,11 @@ using Rocks: Observable
             ps = pressables(tree)
             fields = filter(p -> haskey(p.props, :on_text_input), ps)
             @test length(fields) == 4
-            # No grayed out arrows with a live selection.
-            @test !any(p -> get(p.props, :disabled, false), ps)
+            # No grayed out arrows with a live selection; the only disabled
+            # controls are the 6 align buttons (one root is the bounding
+            # rectangle — a no-op, so they gray out below two roots).
+            disabled = filter(p -> get(p.props, :disabled, false), ps)
+            @test length(disabled) == 6
         end
     end
 end
@@ -2213,5 +2217,169 @@ end
         @test is_group(doc[][6])
         @test sort(resolve_leaves(doc[], [6])) == [1, 3]
         @test selection[] == [6]
+    end
+end
+
+@testset "align tools: align_arts" begin
+    # Each selected entry is one alignment root: a selected group moves as
+    # one (its members together), selected shapes move individually — even
+    # members of one group. Per axis (:min/:center/:max, :none keeps it)
+    # every root's own bounding box lands on the roots' bounding
+    # rectangle's edge/centre.
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    bbox(a) = document_bounds([a])
+    a = ArtObject("a", [ring(10.0, 10.0, 30.0, 20.0)], 0)   # (10..30, 10..20)
+    b = ArtObject("b", [ring(100.0, 50.0, 130.0, 70.0)], 0) # (100..130, 50..70)
+    doc = [a, b]
+
+    # x=:min: both left edges at the rectangle's; y untouched.
+    d = align_arts(doc, [1, 2]; x = :min)
+    @test bbox(d[1]) == (Point(10.0, 10.0), Point(30.0, 20.0))
+    @test bbox(d[2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+    # x=:max: both right edges at 130; a moves, b stays.
+    d = align_arts(doc, [1, 2]; x = :max)
+    @test bbox(d[1]) == (Point(110.0, 10.0), Point(130.0, 20.0))
+    @test bbox(d[2]) == (Point(100.0, 50.0), Point(130.0, 70.0))
+    # x=:center: both centres at the rectangle's centre (70).
+    d = align_arts(doc, [1, 2]; x = :center)
+    @test bbox(d[1]) == (Point(60.0, 10.0), Point(80.0, 20.0))
+    @test bbox(d[2]) == (Point(55.0, 50.0), Point(85.0, 70.0))
+    # y=:max: tops at 70 (world y-up — the positive edge is the top).
+    d = align_arts(doc, [1, 2]; y = :max)
+    @test bbox(d[1]) == (Point(10.0, 60.0), Point(30.0, 70.0))
+    @test bbox(d[2]) == (Point(100.0, 50.0), Point(130.0, 70.0))
+    # y=:min: bottoms at 10.
+    d = align_arts(doc, [1, 2]; y = :min)
+    @test bbox(d[1]) == (Point(10.0, 10.0), Point(30.0, 20.0))
+    @test bbox(d[2]) == (Point(100.0, 10.0), Point(130.0, 30.0))
+    # y=:center: both centres at 40.
+    d = align_arts(doc, [1, 2]; y = :center)
+    @test bbox(d[1]) == (Point(10.0, 35.0), Point(30.0, 45.0))
+    @test bbox(d[2]) == (Point(100.0, 30.0), Point(130.0, 50.0))
+    # Both axes at once; :none keeps an axis.
+    d = align_arts(doc, [1, 2]; x = :min, y = :min)
+    @test bbox(d[2]) == (Point(10.0, 10.0), Point(40.0, 30.0))
+    d = align_arts(doc, [1, 2]; x = :center, y = :none)
+    @test bbox(d[2]) == (Point(55.0, 50.0), Point(85.0, 70.0))
+    # One root is the rectangle itself — a no-op.
+    @test align_arts(doc, [1]; x = :center, y = :center) == doc
+    # An empty selection and a bogus axis are no-ops.
+    @test align_arts(doc, Int[]; x = :min) == doc
+    @test align_arts(doc, [1, 2]; x = :bogus) == doc
+
+    # A directly selected group is ONE root: its members move together
+    # (relative offsets preserved), another selected shape moves alone.
+    c = ArtObject("c", [ring(200.0, 200.0, 210.0, 210.0)], 0)
+    gdoc = group_arts([a, b, c], [1, 2])   # [a, b, c, Group(a, b)]
+    d = align_arts(gdoc, [4, 3]; x = :min, y = :max)
+    @test bbox(d[1]) == (Point(10.0, 150.0), Point(30.0, 160.0))
+    @test bbox(d[2]) == (Point(100.0, 190.0), Point(130.0, 210.0))
+    @test bbox(d[3]) == (Point(10.0, 200.0), Point(20.0, 210.0))
+
+    # Two members of one group selected: they move individually, the third
+    # member and the group entry stay.
+    d = align_arts(gdoc, [1, 2]; x = :min)
+    @test bbox(d[1]) == (Point(10.0, 10.0), Point(30.0, 20.0))
+    @test bbox(d[2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+    @test bbox(d[3]) == (Point(200.0, 200.0), Point(210.0, 210.0))
+
+    # A group and its own member selected: the group is already the
+    # rectangle (its member's bbox sits inside it), so only the member's
+    # own root moves it — one translate, never a double move.
+    d = align_arts(gdoc, [4, 1]; x = :center, y = :none)
+    @test bbox(d[1]) == (Point(60.0, 10.0), Point(80.0, 20.0))
+    @test bbox(d[2]) == (Point(100.0, 50.0), Point(130.0, 70.0))
+    @test bbox(d[3]) == (Point(200.0, 200.0), Point(210.0, 210.0))
+end
+
+@testset "align tools in the top toolbar" begin
+    # The toolbar's align section next to the placement inputs: 6 buttons
+    # (3 per axis), enabled from two selected roots, each writing one
+    # align_arts result into the document.
+    import SDL3
+    doc = Observable(ArtObject[])
+    selection = Observable(Int[])
+    tool = Observable(:mouse)
+
+    ring(x0, y0, x1, y1) = PolyLine([Point(x0, y0), Point(x1, y0),
+                                     Point(x1, y1), Point(x0, y1)], true)
+    bbox(a) = document_bounds([a])
+    doc[] = [ArtObject("a", [ring(10.0, 10.0, 30.0, 20.0)], 0),
+             ArtObject("b", [ring(100.0, 50.0, 130.0, 70.0)], 0)]
+
+    Rocks.with_tree(() -> App(doc = doc, selection = selection,
+                              tool = tool)) do root
+        windows = Rocks.sync_windows!(root)
+        main = windows[findfirst(
+            w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, windows)]
+        Rocks.draw_window!(main)
+        # A doc write re-renders the strip: re-sync windows and re-draw so
+        # the rebuilt buttons carry their laid-out rects, then re-find them.
+        sync() = begin
+            Rocks.drain_events!()
+            Rocks.flush_dirty!()
+            Rocks.run_effects!()
+            wins = Rocks.sync_windows!(root)
+            main = wins[findfirst(
+                w -> Rocks.find_kind(w, Rocks.Canvas) !== nothing, wins)]
+            Rocks.draw_window!(main)
+        end
+        align_buttons() = Rocks.find_fibers(
+            Rocks.find_kind(main, BlazeCraftGUI.PositionToolbar)) do fib
+            fib.kind === Rocks.Pressable && fib.rect[4] ≈ 20.0
+        end
+        # The align buttons: the top toolbar's Mechanics.Buttons of the
+        # 20 px height, in grid order — the x axis (min/centre/max), then
+        # the y axis (max/centre/min).
+        @test Rocks.find_kind(main, BlazeCraftGUI.PositionToolbar) !== nothing
+        @test length(align_buttons()) == 6
+        @test all(b -> Bool(get(b.props, :disabled, false)), align_buttons())
+
+        # Two selected roots: enabled; the x-min button aligns left edges.
+        selection[] = [1, 2]
+        sync()
+        @test all(b -> !Bool(get(b.props, :disabled, false)), align_buttons())
+        # Each click re-computes the rectangle from the current doc, so the
+        # clicks compound (the model testset pins the per-click math).
+        Rocks.click!(align_buttons()[1])              # x-min
+        sync()
+        @test bbox(doc[][1]) == (Point(10.0, 10.0), Point(30.0, 20.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+        # x-center: the rectangle is now x (10..40) — both centres at 25.
+        Rocks.click!(align_buttons()[2])
+        sync()
+        @test bbox(doc[][1]) == (Point(15.0, 10.0), Point(35.0, 20.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+        # x-max: the rectangle stays x (10..40) — both right edges at 40.
+        Rocks.click!(align_buttons()[3])
+        sync()
+        @test bbox(doc[][1]) == (Point(20.0, 10.0), Point(40.0, 20.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+        # y-max: the rectangle is y (10..70) — both tops at 70.
+        Rocks.click!(align_buttons()[4])
+        sync()
+        @test bbox(doc[][1]) == (Point(20.0, 60.0), Point(40.0, 70.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+        # y-center: the rectangle is now y (50..70) — both centres at 60.
+        Rocks.click!(align_buttons()[5])
+        sync()
+        @test bbox(doc[][1]) == (Point(20.0, 55.0), Point(40.0, 65.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+        # y-min: the rectangle stays y (50..70) — both bottoms at 50.
+        Rocks.click!(align_buttons()[6])
+        sync()
+        @test bbox(doc[][1]) == (Point(20.0, 50.0), Point(40.0, 60.0))
+        @test bbox(doc[][2]) == (Point(10.0, 50.0), Point(40.0, 70.0))
+
+        # Back to one selected root: the buttons gray out and a click is a
+        # no-op.
+        selection[] = [1]
+        sync()
+        @test all(b -> Bool(get(b.props, :disabled, false)), align_buttons())
+        before = doc[]
+        Rocks.click!(align_buttons()[1])
+        sync()
+        @test doc[] == before
     end
 end

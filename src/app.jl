@@ -460,11 +460,47 @@ function PositionToolbar(; doc = Observable(ArtObject[]),
     wh_column = @rock Column(
         spinner_row("W", w_size, v -> resize_to!(v, :w)),
         spinner_row("H", h_size, v -> resize_to!(v, :h)); gap = 2)
+    # The alignment tools next to the placement inputs: 6 buttons, 3 per
+    # axis, each aligning at the negative, centre or positive edge of the
+    # selection's bounding rectangle — the selected roots only (a directly
+    # selected group moves as one, multiple selected items move
+    # individually). They gray out below two selected roots (one root is
+    # the rectangle — a no-op).
+    can_align = length(selection_obs[]) >= 2
+    function align_button(icon_name, axis, dir)
+        @rock Mechanics.Button(
+            @rock Font(font = MDI_FONT, size = 14, weight = "medium",
+                       variant = "normal";
+                       @rock E.Icon(name = MDI_GLYPHS[icon_name]; size = 14,
+                                    color = t.colors.text));
+            on_press = () -> (doc_obs[] =
+                align_arts(doc_obs[], selection_obs[];
+                           x = axis === :x ? dir : :none,
+                           y = axis === :y ? dir : :none)),
+            disabled = !can_align,
+            width = 18, height = 20, padding = 0, gap = 0,
+            radius = 0,
+            text_color = t.colors.text,
+            border_color = t.colors.border, border_width = 1,
+            bevel = :raised)
+    end
+    align_grid = @rock Column(
+        @rock Row(align_button("align-horizontal-left", :x, :min),
+                  align_button("align-horizontal-center", :x, :center),
+                  align_button("align-horizontal-right", :x, :max);
+                  gap = 1, align = :center),
+        @rock Row(align_button("align-vertical-top", :y, :max),
+                  align_button("align-vertical-center", :y, :center),
+                  align_button("align-vertical-bottom", :y, :min);
+                  gap = 1, align = :center);
+        gap = 2, align = :center)
     return @rock Box(
         grid,
         xy_column,
         wh_column,
-        @rock Box(lock_btn; align = :center, direction = :row);
+        @rock Box(lock_btn; align = :center, direction = :row),
+        (@rock Box(; width = 1, height = 20, background = t.colors.border)),
+        align_grid;
         direction = :row, gap = 10, padding = 3, align = :center,
         background = t.gradients.toolbar, fill = fill)
 end
